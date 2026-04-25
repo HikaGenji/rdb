@@ -124,6 +124,20 @@ impl SymbolStore {
     }
 }
 
+/// Carries the Arrow snapshots and per-symbol row counts for one rollup cycle.
+///
+/// Pass to [`StoreSet::commit_rollup`] **only after** the Parquet files have
+/// been durably written (and atomically renamed into place). If the write
+/// fails, drop this value — the rows remain in memory for the next cycle.
+pub struct RollupBatch {
+    pub trades: RecordBatch,
+    pub quotes: RecordBatch,
+    /// Number of rows captured per symbol for the `trades` snapshot.
+    trades_counts: Vec<usize>,
+    /// Number of rows captured per symbol for the `quotes` snapshot.
+    quotes_counts: Vec<usize>,
+}
+
 /// All per-symbol stores. Owns the Arrow schemas it materializes.
 pub struct StoreSet {
     pub stores: Vec<Arc<SymbolStore>>,
@@ -221,90 +235,119 @@ impl StoreSet {
         Ok(RecordBatch::try_new(self.quotes_schema.clone(), arrays)?)
     }
 
-    /// Snapshot all live trades into a `RecordBatch` **and immediately clear
-    /// every symbol's store** while holding the per-symbol lock.
+    /// Snapshot both live tables for a rollup cycle **without clearing them**.
     ///
-    /// Rows that arrive on the ingest thread between two successive symbol
-    /// locks land in the now-empty store and will be captured in the next
-    /// rollup — no data is lost as long as writing the resulting Parquet file
-    /// succeeds before the next call.
-    pub fn snapshot_and_clear_trades(&self) -> anyhow::Result<RecordBatch> {
-        let mut symbol = Vec::new();
-        let mut symbol_id = Vec::new();
-        let mut seq = Vec::new();
-        let mut ts_exchange_ns = Vec::new();
-        let mut ts_local_ns = Vec::new();
-        let mut price = Vec::new();
-        let mut qty = Vec::new();
-        let mut side = Vec::new();
+    /// The returned [`RollupBatch`] carries the Arrow data plus the per-symbol
+    /// row counts captured at snapshot time. Pass it to [`commit_rollup`] once
+    /// the Parquet files have been durably written; that call trims exactly
+    /// those rows from the front of each VecDeque. If writing fails, simply
+    /// drop the `RollupBatch` — the rows remain in memory and will be included
+    /// in the next cycle.
+    pub fn snapshot_for_rollup(&self) -> anyhow::Result<RollupBatch> {
+        // --- trades ---
+        let mut t_symbol = Vec::new();
+        let mut t_symbol_id = Vec::new();
+        let mut t_seq = Vec::new();
+        let mut t_ts_exchange_ns = Vec::new();
+        let mut t_ts_local_ns = Vec::new();
+        let mut t_price = Vec::new();
+        let mut t_qty = Vec::new();
+        let mut t_side = Vec::new();
+        let mut trades_counts = Vec::with_capacity(self.stores.len());
 
         for store in &self.stores {
-            let mut cols = store.trades.lock();
+            let cols = store.trades.lock();
+            trades_counts.push(cols.len());
             for i in 0..cols.len() {
-                symbol.push(store.symbol.clone());
-                symbol_id.push(store.symbol_id);
-                seq.push(cols.seq[i]);
-                ts_exchange_ns.push(cols.ts_exchange_ns[i]);
-                ts_local_ns.push(cols.ts_local_ns[i]);
-                price.push(decode_fixed(cols.price[i], store.price_scale));
-                qty.push(decode_fixed(cols.qty[i], store.qty_scale));
-                side.push(Side::from_u8(cols.side[i]).as_str().to_string());
+                t_symbol.push(store.symbol.clone());
+                t_symbol_id.push(store.symbol_id);
+                t_seq.push(cols.seq[i]);
+                t_ts_exchange_ns.push(cols.ts_exchange_ns[i]);
+                t_ts_local_ns.push(cols.ts_local_ns[i]);
+                t_price.push(decode_fixed(cols.price[i], store.price_scale));
+                t_qty.push(decode_fixed(cols.qty[i], store.qty_scale));
+                t_side.push(Side::from_u8(cols.side[i]).as_str().to_string());
             }
-            *cols = TradeColumns::default();
         }
-        let arrays: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(symbol)),
-            Arc::new(UInt32Array::from(symbol_id)),
-            Arc::new(UInt64Array::from(seq)),
-            Arc::new(UInt64Array::from(ts_exchange_ns)),
-            Arc::new(UInt64Array::from(ts_local_ns)),
-            Arc::new(Float64Array::from(price)),
-            Arc::new(Float64Array::from(qty)),
-            Arc::new(StringArray::from(side)),
-        ];
-        Ok(RecordBatch::try_new(self.trades_schema.clone(), arrays)?)
+        let trades = RecordBatch::try_new(
+            self.trades_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(t_symbol)),
+                Arc::new(UInt32Array::from(t_symbol_id)),
+                Arc::new(UInt64Array::from(t_seq)),
+                Arc::new(UInt64Array::from(t_ts_exchange_ns)),
+                Arc::new(UInt64Array::from(t_ts_local_ns)),
+                Arc::new(Float64Array::from(t_price)),
+                Arc::new(Float64Array::from(t_qty)),
+                Arc::new(StringArray::from(t_side)),
+            ],
+        )?;
+
+        // --- quotes ---
+        let mut q_symbol = Vec::new();
+        let mut q_symbol_id = Vec::new();
+        let mut q_seq = Vec::new();
+        let mut q_ts_exchange_ns = Vec::new();
+        let mut q_ts_local_ns = Vec::new();
+        let mut q_bid_price = Vec::new();
+        let mut q_bid_qty = Vec::new();
+        let mut q_ask_price = Vec::new();
+        let mut q_ask_qty = Vec::new();
+        let mut quotes_counts = Vec::with_capacity(self.stores.len());
+
+        for store in &self.stores {
+            let cols = store.quotes.lock();
+            quotes_counts.push(cols.len());
+            for i in 0..cols.len() {
+                q_symbol.push(store.symbol.clone());
+                q_symbol_id.push(store.symbol_id);
+                q_seq.push(cols.seq[i]);
+                q_ts_exchange_ns.push(cols.ts_exchange_ns[i]);
+                q_ts_local_ns.push(cols.ts_local_ns[i]);
+                q_bid_price.push(decode_fixed(cols.bid_price[i], store.price_scale));
+                q_bid_qty.push(decode_fixed(cols.bid_qty[i], store.qty_scale));
+                q_ask_price.push(decode_fixed(cols.ask_price[i], store.price_scale));
+                q_ask_qty.push(decode_fixed(cols.ask_qty[i], store.qty_scale));
+            }
+        }
+        let quotes = RecordBatch::try_new(
+            self.quotes_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(q_symbol)),
+                Arc::new(UInt32Array::from(q_symbol_id)),
+                Arc::new(UInt64Array::from(q_seq)),
+                Arc::new(UInt64Array::from(q_ts_exchange_ns)),
+                Arc::new(UInt64Array::from(q_ts_local_ns)),
+                Arc::new(Float64Array::from(q_bid_price)),
+                Arc::new(Float64Array::from(q_bid_qty)),
+                Arc::new(Float64Array::from(q_ask_price)),
+                Arc::new(Float64Array::from(q_ask_qty)),
+            ],
+        )?;
+
+        Ok(RollupBatch { trades, quotes, trades_counts, quotes_counts })
     }
 
-    /// Snapshot all live quotes **and immediately clear every symbol's store**.
-    /// See [`snapshot_and_clear_trades`] for the consistency model.
-    pub fn snapshot_and_clear_quotes(&self) -> anyhow::Result<RecordBatch> {
-        let mut symbol = Vec::new();
-        let mut symbol_id = Vec::new();
-        let mut seq = Vec::new();
-        let mut ts_exchange_ns = Vec::new();
-        let mut ts_local_ns = Vec::new();
-        let mut bid_price = Vec::new();
-        let mut bid_qty = Vec::new();
-        let mut ask_price = Vec::new();
-        let mut ask_qty = Vec::new();
-
-        for store in &self.stores {
-            let mut cols = store.quotes.lock();
-            for i in 0..cols.len() {
-                symbol.push(store.symbol.clone());
-                symbol_id.push(store.symbol_id);
-                seq.push(cols.seq[i]);
-                ts_exchange_ns.push(cols.ts_exchange_ns[i]);
-                ts_local_ns.push(cols.ts_local_ns[i]);
-                bid_price.push(decode_fixed(cols.bid_price[i], store.price_scale));
-                bid_qty.push(decode_fixed(cols.bid_qty[i], store.qty_scale));
-                ask_price.push(decode_fixed(cols.ask_price[i], store.price_scale));
-                ask_qty.push(decode_fixed(cols.ask_qty[i], store.qty_scale));
+    /// Trim the rows captured by [`snapshot_for_rollup`] from the front of
+    /// every symbol's VecDeque. Call this **only after** the Parquet files
+    /// have been successfully written and renamed into place.
+    ///
+    /// Because ingest appends to the *back* of each deque, trimming the first
+    /// N rows from the *front* removes exactly the snapshot rows without
+    /// touching anything that arrived during the write.
+    pub fn commit_rollup(&self, batch: &RollupBatch) {
+        for (store, &n) in self.stores.iter().zip(&batch.trades_counts) {
+            let mut cols = store.trades.lock();
+            for _ in 0..n.min(cols.len()) {
+                cols.pop_oldest();
             }
-            *cols = QuoteColumns::default();
         }
-        let arrays: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(symbol)),
-            Arc::new(UInt32Array::from(symbol_id)),
-            Arc::new(UInt64Array::from(seq)),
-            Arc::new(UInt64Array::from(ts_exchange_ns)),
-            Arc::new(UInt64Array::from(ts_local_ns)),
-            Arc::new(Float64Array::from(bid_price)),
-            Arc::new(Float64Array::from(bid_qty)),
-            Arc::new(Float64Array::from(ask_price)),
-            Arc::new(Float64Array::from(ask_qty)),
-        ];
-        Ok(RecordBatch::try_new(self.quotes_schema.clone(), arrays)?)
+        for (store, &n) in self.stores.iter().zip(&batch.quotes_counts) {
+            let mut cols = store.quotes.lock();
+            for _ in 0..n.min(cols.len()) {
+                cols.pop_oldest();
+            }
+        }
     }
 
     pub fn store_for(&self, symbol_id: u32) -> Option<&Arc<SymbolStore>> {

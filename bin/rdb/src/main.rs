@@ -471,16 +471,17 @@ fn run_rollup_thread(stores: Arc<StoreSet>, hdb_dir: Arc<PathBuf>, interval_secs
         let ts_secs = unix_secs_now();
         let date = unix_secs_to_date(ts_secs);
 
-        let trades_rb = match stores.snapshot_and_clear_trades() {
-            Ok(rb) => rb,
-            Err(e) => { error!(error = %e, "rollup: trades snapshot failed"); continue; }
-        };
-        let quotes_rb = match stores.snapshot_and_clear_quotes() {
-            Ok(rb) => rb,
-            Err(e) => { error!(error = %e, "rollup: quotes snapshot failed"); continue; }
+        // Snapshot without clearing: rows stay in memory until the Parquet
+        // files are durably on disk (atomic rename). If any write fails we
+        // simply log and continue; those rows will be included next cycle.
+        let batch = match stores.snapshot_for_rollup() {
+            Ok(b) => b,
+            Err(e) => { error!(error = %e, "rollup: snapshot failed"); continue; }
         };
 
-        for (table, rb) in [("trades", trades_rb), ("quotes", quotes_rb)] {
+        let mut all_ok = true;
+
+        for (table, rb) in [("trades", &batch.trades), ("quotes", &batch.quotes)] {
             if rb.num_rows() == 0 {
                 continue;
             }
@@ -488,10 +489,30 @@ fn run_rollup_thread(stores: Arc<StoreSet>, hdb_dir: Arc<PathBuf>, interval_secs
                 .join(table)
                 .join(format!("date={date}"))
                 .join(format!("{ts_secs}.parquet"));
-            match rollup_write_parquet(&conn, rb, &out) {
-                Ok(()) => info!(rows = %out.display(), "rollup: chunk written"),
-                Err(e) => error!(error = %e, path = %out.display(), "rollup: write failed"),
+            // Write to a .tmp file first, then atomically rename.
+            let tmp = out.with_extension("parquet.tmp");
+            match rollup_write_parquet(&conn, rb.clone(), &tmp) {
+                Ok(()) => match std::fs::rename(&tmp, &out) {
+                    Ok(()) => info!(path = %out.display(), rows = rb.num_rows(), "rollup: chunk written"),
+                    Err(e) => {
+                        error!(error = %e, path = %out.display(), "rollup: rename failed");
+                        let _ = std::fs::remove_file(&tmp);
+                        all_ok = false;
+                    }
+                },
+                Err(e) => {
+                    error!(error = %e, path = %tmp.display(), "rollup: write failed");
+                    let _ = std::fs::remove_file(&tmp);
+                    all_ok = false;
+                }
             }
+        }
+
+        // Only trim the snapshotted rows from memory after both files are safe.
+        if all_ok {
+            stores.commit_rollup(&batch);
+        } else {
+            warn!("rollup: skipping commit — rows retained for next cycle");
         }
     }
 }
