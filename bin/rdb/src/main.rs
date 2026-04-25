@@ -4,15 +4,25 @@
 //! the corresponding per-symbol [`tp_arrow::SymbolStore`], and serves SQL
 //! queries on a Unix domain socket. Each query opens a fresh DuckDB
 //! in-memory database, snapshots the per-symbol stores into two
-//! consolidated `RecordBatch`es (`trades` and `quotes`), zero-copies them
-//! into DuckDB via the `arrow(?, ?)` table function, and runs the query.
+//! consolidated `RecordBatch`es and registers them as `trades_live` /
+//! `quotes_live`.
 //!
-//! For prototype simplicity this binary owns a dedicated ingest thread
-//! and a dedicated query-server thread; query latency does not block the
-//! ingest path beyond the brief snapshot lock.
+//! When `--hdb <dir>` is supplied, Parquet files written by `hdb-rollup`
+//! are also mounted:
+//!
+//! ```text
+//! trades_live  – today's in-memory rows
+//! trades_hist  – read_parquet('<dir>/trades/*.parquet')   (if any exist)
+//! trades       – UNION ALL of the two above
+//! quotes_live / quotes_hist / quotes – same pattern
+//! ```
+//!
+//! Clients that only know about `trades` / `quotes` continue to work
+//! unchanged; they automatically pick up historical rows once an HDB
+//! directory is configured.
 
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +50,12 @@ struct Args {
     /// Unix socket path on which the SQL endpoint listens.
     #[arg(long, default_value = "/tmp/rdb.sock")]
     socket: PathBuf,
+
+    /// HDB directory produced by `hdb-rollup`. When set, Parquet files
+    /// inside `<dir>/trades/` and `<dir>/quotes/` are mounted alongside
+    /// the live in-memory tables.
+    #[arg(long)]
+    hdb: Option<PathBuf>,
 
     /// Idle sleep in the ingest loop (microseconds).
     #[arg(long, default_value_t = 200)]
@@ -78,11 +94,16 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", socket_path.display()))?;
     info!(socket = %socket_path.display(), "query endpoint listening");
 
+    let hdb_dir: Option<Arc<PathBuf>> = args.hdb.as_ref().map(|p| Arc::new(p.clone()));
+    if let Some(ref hdb) = hdb_dir {
+        info!(hdb = %hdb.display(), "HDB directory configured");
+    }
+
     let stores_for_query = stores.clone();
     let _query_thread = std::thread::Builder::new()
         .name("rdb-query".into())
         .spawn(move || {
-            run_query_server(listener, stores_for_query);
+            run_query_server(listener, stores_for_query, hdb_dir);
         })?;
 
     run_ingest_loop(args, stores, trade_lat, quote_lat)
@@ -194,13 +215,14 @@ fn run_ingest_loop(
     Ok(())
 }
 
-fn run_query_server(listener: UnixListener, stores: Arc<StoreSet>) {
+fn run_query_server(listener: UnixListener, stores: Arc<StoreSet>, hdb_dir: Option<Arc<PathBuf>>) {
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let stores = stores.clone();
+                let hdb_dir = hdb_dir.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, stores) {
+                    if let Err(e) = handle_connection(stream, stores, hdb_dir) {
                         warn!(error = %e, "query connection failed");
                     }
                 });
@@ -213,11 +235,15 @@ fn run_query_server(listener: UnixListener, stores: Arc<StoreSet>) {
     }
 }
 
-fn handle_connection(mut stream: UnixStream, stores: Arc<StoreSet>) -> anyhow::Result<()> {
+fn handle_connection(
+    mut stream: UnixStream,
+    stores: Arc<StoreSet>,
+    hdb_dir: Option<Arc<PathBuf>>,
+) -> anyhow::Result<()> {
     let sql = query_proto::read_request(&mut stream)?;
     info!(sql_chars = sql.len(), "query received");
 
-    match run_query(sql.as_str(), &stores) {
+    match run_query(sql.as_str(), &stores, hdb_dir.as_ref().map(|p| p.as_path())) {
         Ok(payload) => query_proto::write_response(&mut stream, query_proto::STATUS_OK, &payload)?,
         Err(e) => {
             let msg = format!("{:#}", e);
@@ -227,18 +253,19 @@ fn handle_connection(mut stream: UnixStream, stores: Arc<StoreSet>) -> anyhow::R
     Ok(())
 }
 
-fn run_query(sql: &str, stores: &StoreSet) -> anyhow::Result<Vec<u8>> {
+fn run_query(sql: &str, stores: &StoreSet, hdb_dir: Option<&Path>) -> anyhow::Result<Vec<u8>> {
     let trades_rb = stores.snapshot_trades()?;
     let quotes_rb = stores.snapshot_quotes()?;
 
     let conn = Connection::open_in_memory()?;
     conn.register_table_function::<ArrowVTab>("arrow")?;
 
-    // Bind both batches into temporary tables. CREATE TABLE AS materializes
-    // the rows once into DuckDB-managed storage, after which we can run
-    // arbitrary user SQL against `trades` / `quotes`.
-    create_temp_table(&conn, "trades", trades_rb)?;
-    create_temp_table(&conn, "quotes", quotes_rb)?;
+    // Always materialise live data as *_live tables.
+    create_arrow_table(&conn, "trades_live", trades_rb)?;
+    create_arrow_table(&conn, "quotes_live", quotes_rb)?;
+
+    // Mount historical Parquet files and build the union views.
+    mount_hdb(&conn, hdb_dir)?;
 
     let mut stmt = conn.prepare(sql)?;
     let arrow_iter = stmt.query_arrow([])?;
@@ -248,12 +275,60 @@ fn run_query(sql: &str, stores: &StoreSet) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn create_temp_table(conn: &Connection, name: &str, rb: RecordBatch) -> anyhow::Result<()> {
+/// Register an Arrow RecordBatch as a materialised DuckDB temporary table.
+fn create_arrow_table(conn: &Connection, name: &str, rb: RecordBatch) -> anyhow::Result<()> {
     let params = arrow_recordbatch_to_query_params(rb);
     let sql = format!("CREATE TEMP TABLE {name} AS SELECT * FROM arrow(?, ?)");
     let mut stmt = conn.prepare(&sql)?;
     stmt.execute(params)?;
     Ok(())
+}
+
+/// Mount HDB Parquet files and wire up the `trades` / `quotes` views.
+///
+/// If `hdb_dir` is None, or a subdirectory has no `.parquet` files, the
+/// corresponding view is a plain alias for the live table.
+fn mount_hdb(conn: &Connection, hdb_dir: Option<&Path>) -> anyhow::Result<()> {
+    let trades_view = build_union_view(conn, "trades", hdb_dir)?;
+    let quotes_view = build_union_view(conn, "quotes", hdb_dir)?;
+    conn.execute_batch(&format!("{trades_view}\n{quotes_view}"))?;
+    Ok(())
+}
+
+/// Returns a `CREATE VIEW <name> AS …` DDL string.
+fn build_union_view(conn: &Connection, name: &str, hdb_dir: Option<&Path>) -> anyhow::Result<String> {
+    let _ = conn; // reserved for future schema validation
+    let live = format!("{name}_live");
+
+    let hist_glob = hdb_dir.map(|d| d.join(name).join("*.parquet"));
+    let has_hist = hist_glob
+        .as_ref()
+        .map(|g| has_parquet_files(g.parent().unwrap()))
+        .unwrap_or(false);
+
+    if has_hist {
+        let glob = hist_glob.unwrap();
+        Ok(format!(
+            "CREATE VIEW {name}_hist AS SELECT * FROM read_parquet('{glob}');\n\
+             CREATE VIEW {name} AS SELECT * FROM {live} UNION ALL SELECT * FROM {name}_hist;",
+            glob = glob.display(),
+        ))
+    } else {
+        Ok(format!("CREATE VIEW {name} AS SELECT * FROM {live};"))
+    }
+}
+
+fn has_parquet_files(dir: &Path) -> bool {
+    dir.read_dir()
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext.eq_ignore_ascii_case("parquet"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn init_tracing() {

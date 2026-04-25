@@ -1,0 +1,22 @@
+[package]
+name = "hdb-rollup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hdb-rollup"
+path = "src/main.rs"
+
+[dependencies]
+tp-types  = { workspace = true }
+tp-arrow  = { workspace = true }
+
+arrow-array  = { workspace = true }
+arrow-schema = { workspace = true }
+arrow        = { workspace = true }
+
+duckdb = { workspace = true, features = ["vtab-arrow", "bundled"] }
+
+anyhow = { workspace = true }
+clap   = { workspace = true }
