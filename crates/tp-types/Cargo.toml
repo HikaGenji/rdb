@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 bytemuck = { workspace = true }
+iceoryx2 = { workspace = true }
 serde    = { workspace = true }

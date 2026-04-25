@@ -13,8 +13,7 @@ tp-types  = { workspace = true }
 tp-config = { workspace = true }
 tp-wal    = { workspace = true }
 
-zenoh              = { workspace = true }
-tokio              = { workspace = true }
+iceoryx2           = { workspace = true }
 clap               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
