@@ -2,23 +2,47 @@
 //!
 //! Subscribes to the tickerplant's `*/agg` topics, appends each record to
 //! the corresponding per-symbol [`tp_arrow::SymbolStore`], and serves SQL
-//! queries on a Unix domain socket. Each query opens a fresh DuckDB
-//! in-memory database, snapshots the per-symbol stores into two
-//! consolidated `RecordBatch`es (`trades` and `quotes`), zero-copies them
-//! into DuckDB via the `arrow(?, ?)` table function, and runs the query.
+//! queries on a Unix domain socket.
 //!
-//! For prototype simplicity this binary owns a dedicated ingest thread
-//! and a dedicated query-server thread; query latency does not block the
-//! ingest path beyond the brief snapshot lock.
+//! ## Query concurrency
+//!
+//! A pool of `--query-workers` (default 4) persistent DuckDB connections is
+//! shared across incoming queries. Each connection is initialised once
+//! (open + ArrowVTab registration + HDB Parquet metadata cached on first
+//! use). Per query, only the live `trades_live` / `quotes_live` temp tables
+//! are dropped and recreated from a fresh Arrow snapshot; the HDB views and
+//! DuckDB internals stay warm. This eliminates the ~1–5 ms per-query
+//! connection-open overhead and lets DuckDB reuse cached Parquet file
+//! metadata across queries on the same worker.
+//!
+//! ## Memory cap
+//!
+//! `--row-cap N` (default 0 = unlimited) sets a per-symbol row limit on the
+//! in-memory stores. When a push would exceed the cap the oldest row is
+//! evicted in O(1) via `VecDeque::pop_front`.
+//!
+//! ## HDB views
+//!
+//! When `--hdb <dir>` is supplied, Parquet files written by `hdb-rollup`
+//! are mounted at query time using Hive partitioning:
+//!
+//! ```text
+//! trades_live  – today's in-memory rows
+//! trades_hist  – read_parquet('<dir>/trades/**/*.parquet', hive_partitioning=true)
+//!                (if any files exist; date column stripped to match live schema)
+//! trades       – UNION ALL of the two above
+//! quotes_live / quotes_hist / quotes – same pattern
+//! ```
 
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use arrow_array::RecordBatch;
 use clap::Parser;
+use crossbeam_channel as chan;
 use duckdb::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
 use duckdb::Connection;
 use iceoryx2::prelude::*;
@@ -40,6 +64,31 @@ struct Args {
     /// Unix socket path on which the SQL endpoint listens.
     #[arg(long, default_value = "/tmp/rdb.sock")]
     socket: PathBuf,
+
+    /// HDB directory produced by `hdb-rollup`. When set, Parquet files
+    /// inside `<dir>/trades/` and `<dir>/quotes/` are mounted alongside
+    /// the live in-memory tables using Hive partitioning.
+    #[arg(long)]
+    hdb: Option<PathBuf>,
+
+    /// Number of persistent DuckDB query workers. Each worker holds one
+    /// open connection; incoming queries queue when all workers are busy.
+    #[arg(long, default_value_t = 4)]
+    query_workers: usize,
+
+    /// Per-symbol row cap for in-memory stores. 0 = unlimited.
+    /// When set, the oldest row is evicted in O(1) on each push that
+    /// would exceed this limit.
+    #[arg(long, default_value_t = 0)]
+    row_cap: usize,
+
+    /// Intra-day rollup interval in seconds. When > 0 and --hdb is set, a
+    /// background thread wakes every N seconds, snapshots and clears the live
+    /// stores, and writes the rows to a dated Parquet chunk in the HDB
+    /// directory. This bounds peak memory without relying on --row-cap
+    /// eviction, which silently drops rows.  0 = disabled.
+    #[arg(long, default_value_t = 0)]
+    rollup_interval_secs: u64,
 
     /// Idle sleep in the ingest loop (microseconds).
     #[arg(long, default_value_t = 200)]
@@ -78,15 +127,221 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", socket_path.display()))?;
     info!(socket = %socket_path.display(), "query endpoint listening");
 
-    let stores_for_query = stores.clone();
+    let hdb_dir: Option<Arc<PathBuf>> = args.hdb.as_ref().map(|p| Arc::new(p.clone()));
+    if let Some(ref hdb) = hdb_dir {
+        info!(hdb = %hdb.display(), "HDB directory configured");
+    }
+
+    let pool = ConnPool::new(args.query_workers)
+        .context("initialising DuckDB connection pool")?;
+    info!(workers = args.query_workers, "DuckDB connection pool ready");
+
+    if args.rollup_interval_secs > 0 {
+        match &hdb_dir {
+            Some(hdb) => {
+                let stores_r = stores.clone();
+                let hdb_r = hdb.clone();
+                let interval_secs = args.rollup_interval_secs;
+                std::thread::Builder::new()
+                    .name("rdb-rollup".into())
+                    .spawn(move || run_rollup_thread(stores_r, hdb_r, interval_secs))?;
+                info!(interval_secs, "intra-day rollup thread started");
+            }
+            None => {
+                warn!("--rollup-interval-secs ignored: --hdb not set");
+            }
+        }
+    }
+
+    let stores_q = stores.clone();
     let _query_thread = std::thread::Builder::new()
         .name("rdb-query".into())
         .spawn(move || {
-            run_query_server(listener, stores_for_query);
+            run_query_server(listener, stores_q, hdb_dir, pool);
         })?;
 
     run_ingest_loop(args, stores, trade_lat, quote_lat)
 }
+
+// ---------------------------------------------------------------------------
+// Connection pool
+// ---------------------------------------------------------------------------
+
+/// A fixed-size pool of persistent DuckDB connections.
+///
+/// Implemented as a bounded channel: `recv` blocks until a connection is
+/// available; `send` returns it. The channel capacity equals the pool size,
+/// so `send` never blocks.
+struct ConnPool {
+    tx: chan::Sender<Connection>,
+    rx: chan::Receiver<Connection>,
+}
+
+impl ConnPool {
+    fn new(size: usize) -> anyhow::Result<Arc<Self>> {
+        let (tx, rx) = chan::bounded(size);
+        for _ in 0..size {
+            let conn = Connection::open_in_memory()?;
+            conn.register_table_function::<ArrowVTab>("arrow")?;
+            tx.send(conn).unwrap();
+        }
+        Ok(Arc::new(Self { tx, rx }))
+    }
+
+    fn acquire(&self) -> Connection {
+        self.rx.recv().expect("pool sender dropped")
+    }
+
+    fn release(&self, conn: Connection) {
+        let _ = self.tx.send(conn);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query server
+// ---------------------------------------------------------------------------
+
+fn run_query_server(
+    listener: UnixListener,
+    stores: Arc<StoreSet>,
+    hdb_dir: Option<Arc<PathBuf>>,
+    pool: Arc<ConnPool>,
+) {
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(stream) => {
+                let stores = stores.clone();
+                let hdb_dir = hdb_dir.clone();
+                let pool = pool.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = handle_connection(stream, stores, hdb_dir, pool) {
+                        warn!(error = %e, "query connection failed");
+                    }
+                });
+            }
+            Err(e) => {
+                error!(error = %e, "accept failed");
+                break;
+            }
+        }
+    }
+}
+
+fn handle_connection(
+    mut stream: UnixStream,
+    stores: Arc<StoreSet>,
+    hdb_dir: Option<Arc<PathBuf>>,
+    pool: Arc<ConnPool>,
+) -> anyhow::Result<()> {
+    let sql = query_proto::read_request(&mut stream)?;
+    info!(sql_chars = sql.len(), "query received");
+
+    let conn = pool.acquire();
+    let result = run_query(sql.as_str(), &stores, hdb_dir.as_ref().map(|p| p.as_path()), &conn);
+    pool.release(conn);
+
+    match result {
+        Ok(payload) => query_proto::write_response(&mut stream, query_proto::STATUS_OK, &payload)?,
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            query_proto::write_response(&mut stream, query_proto::STATUS_ERR, msg.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn run_query(sql: &str, stores: &StoreSet, hdb_dir: Option<&Path>, conn: &Connection) -> anyhow::Result<Vec<u8>> {
+    let trades_rb = stores.snapshot_trades()?;
+    let quotes_rb = stores.snapshot_quotes()?;
+
+    // Drop previous live tables and recreate from the fresh snapshot.
+    // Views (trades, quotes, *_hist) are also recreated so the HDB glob
+    // picks up any new files written by hdb-rollup since the last query.
+    conn.execute_batch(
+        "DROP TABLE  IF EXISTS trades_live;  DROP TABLE  IF EXISTS quotes_live;
+         DROP VIEW   IF EXISTS trades_hist;  DROP VIEW   IF EXISTS quotes_hist;
+         DROP VIEW   IF EXISTS trades;       DROP VIEW   IF EXISTS quotes;",
+    )?;
+
+    create_arrow_table(conn, "trades_live", trades_rb)?;
+    create_arrow_table(conn, "quotes_live", quotes_rb)?;
+    mount_hdb(conn, hdb_dir)?;
+
+    let mut stmt = conn.prepare(sql)?;
+    let arrow_iter = stmt.query_arrow([])?;
+    let result_schema = arrow_iter.get_schema();
+    let batches: Vec<RecordBatch> = arrow_iter.collect();
+    encode_ipc_stream(&batches, &result_schema)
+}
+
+/// Register an Arrow RecordBatch as a materialised DuckDB temporary table.
+fn create_arrow_table(conn: &Connection, name: &str, rb: RecordBatch) -> anyhow::Result<()> {
+    let params = arrow_recordbatch_to_query_params(rb);
+    let sql = format!("CREATE TEMP TABLE {name} AS SELECT * FROM arrow(?, ?)");
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.execute(params)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// HDB mounting
+// ---------------------------------------------------------------------------
+
+fn mount_hdb(conn: &Connection, hdb_dir: Option<&Path>) -> anyhow::Result<()> {
+    let trades_ddl = build_union_view("trades", hdb_dir);
+    let quotes_ddl = build_union_view("quotes", hdb_dir);
+    conn.execute_batch(&format!("{trades_ddl}\n{quotes_ddl}"))?;
+    Ok(())
+}
+
+/// Returns DDL that creates `<name>_hist` (if Parquet files exist) and
+/// `<name>` as UNION ALL of live + hist (or a plain alias when no HDB).
+fn build_union_view(name: &str, hdb_dir: Option<&Path>) -> String {
+    let live = format!("{name}_live");
+    let has_hist = hdb_dir
+        .map(|d| has_parquet_files(&d.join(name)))
+        .unwrap_or(false);
+
+    if has_hist {
+        // Hive layout: <hdb>/<name>/date=YYYY-MM-DD/data.parquet
+        // `hive_partitioning=true` lets DuckDB skip whole date directories
+        // on predicate pushdown. `EXCLUDE (date)` drops the synthetic Hive
+        // partition column so the schema matches the live table exactly.
+        let glob = hdb_dir.unwrap().join(name).join("**").join("*.parquet");
+        format!(
+            "CREATE VIEW {name}_hist AS \
+               SELECT * EXCLUDE (date) \
+               FROM read_parquet('{glob}', hive_partitioning=true);\n\
+             CREATE VIEW {name} AS \
+               SELECT * FROM {live} UNION ALL SELECT * FROM {name}_hist;",
+            glob = glob.display(),
+        )
+    } else {
+        format!("CREATE VIEW {name} AS SELECT * FROM {live};")
+    }
+}
+
+/// Recursively checks whether `dir` contains at least one `.parquet` file.
+fn has_parquet_files(dir: &Path) -> bool {
+    dir.read_dir()
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    has_parquet_files(&p)
+                } else {
+                    p.extension()
+                        .map(|x| x.eq_ignore_ascii_case("parquet"))
+                        .unwrap_or(false)
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Ingest loop
+// ---------------------------------------------------------------------------
 
 fn run_ingest_loop(
     args: Args,
@@ -94,6 +349,8 @@ fn run_ingest_loop(
     trade_lat: Arc<LatencyHistogram>,
     quote_lat: Arc<LatencyHistogram>,
 ) -> anyhow::Result<()> {
+    let row_cap = args.row_cap;
+
     let node = NodeBuilder::new().create::<ipc::Service>()?;
     let trades_svc = node
         .service_builder(&topics::TRADES_AGG.try_into()?)
@@ -132,7 +389,7 @@ fn run_ingest_loop(
             let now = wall_ns();
             trade_lat.record(now.saturating_sub(trade.ts_local_ns));
             if let Some(store) = stores.store_for(trade.symbol_id) {
-                store.trades.lock().push(&trade);
+                store.trades.lock().push(&trade, row_cap);
                 trade_count += 1;
             } else {
                 warn!(symbol_id = trade.symbol_id, "trade for unknown symbol_id");
@@ -146,7 +403,7 @@ fn run_ingest_loop(
             let now = wall_ns();
             quote_lat.record(now.saturating_sub(q.ts_local_ns));
             if let Some(store) = stores.store_for(q.symbol_id) {
-                store.quotes.lock().push(&q);
+                store.quotes.lock().push(&q, row_cap);
                 quote_count += 1;
             } else {
                 warn!(symbol_id = q.symbol_id, "quote for unknown symbol_id");
@@ -194,66 +451,110 @@ fn run_ingest_loop(
     Ok(())
 }
 
-fn run_query_server(listener: UnixListener, stores: Arc<StoreSet>) {
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let stores = stores.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, stores) {
-                        warn!(error = %e, "query connection failed");
+// ---------------------------------------------------------------------------
+// Intra-day rollup thread
+// ---------------------------------------------------------------------------
+
+fn run_rollup_thread(stores: Arc<StoreSet>, hdb_dir: Arc<PathBuf>, interval_secs: u64) {
+    let conn = match Connection::open_in_memory() {
+        Ok(c) => c,
+        Err(e) => { error!(error = %e, "rollup: failed to open DuckDB connection"); return; }
+    };
+    if let Err(e) = conn.register_table_function::<ArrowVTab>("arrow") {
+        error!(error = %e, "rollup: failed to register ArrowVTab"); return;
+    }
+
+    let interval = Duration::from_secs(interval_secs);
+    loop {
+        std::thread::sleep(interval);
+
+        let ts_secs = unix_secs_now();
+        let date = unix_secs_to_date(ts_secs);
+
+        // Snapshot without clearing: rows stay in memory until the Parquet
+        // files are durably on disk (atomic rename). If any write fails we
+        // simply log and continue; those rows will be included next cycle.
+        let batch = match stores.snapshot_for_rollup() {
+            Ok(b) => b,
+            Err(e) => { error!(error = %e, "rollup: snapshot failed"); continue; }
+        };
+
+        let mut all_ok = true;
+
+        for (table, rb) in [("trades", &batch.trades), ("quotes", &batch.quotes)] {
+            if rb.num_rows() == 0 {
+                continue;
+            }
+            let out = hdb_dir
+                .join(table)
+                .join(format!("date={date}"))
+                .join(format!("{ts_secs}.parquet"));
+            // Write to a .tmp file first, then atomically rename.
+            let tmp = out.with_extension("parquet.tmp");
+            match rollup_write_parquet(&conn, rb.clone(), &tmp) {
+                Ok(()) => match std::fs::rename(&tmp, &out) {
+                    Ok(()) => info!(path = %out.display(), rows = rb.num_rows(), "rollup: chunk written"),
+                    Err(e) => {
+                        error!(error = %e, path = %out.display(), "rollup: rename failed");
+                        let _ = std::fs::remove_file(&tmp);
+                        all_ok = false;
                     }
-                });
+                },
+                Err(e) => {
+                    error!(error = %e, path = %tmp.display(), "rollup: write failed");
+                    let _ = std::fs::remove_file(&tmp);
+                    all_ok = false;
+                }
             }
-            Err(e) => {
-                error!(error = %e, "accept failed");
-                break;
-            }
+        }
+
+        // Only trim the snapshotted rows from memory after both files are safe.
+        if all_ok {
+            stores.commit_rollup(&batch);
+        } else {
+            warn!("rollup: skipping commit — rows retained for next cycle");
         }
     }
 }
 
-fn handle_connection(mut stream: UnixStream, stores: Arc<StoreSet>) -> anyhow::Result<()> {
-    let sql = query_proto::read_request(&mut stream)?;
-    info!(sql_chars = sql.len(), "query received");
+/// Write a `RecordBatch` to a Parquet file using the rollup thread's
+/// persistent DuckDB connection.
+fn rollup_write_parquet(conn: &Connection, rb: RecordBatch, out: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(out.parent().context("invalid path")?)
+        .with_context(|| format!("creating dir for {}", out.display()))?;
 
-    match run_query(sql.as_str(), &stores) {
-        Ok(payload) => query_proto::write_response(&mut stream, query_proto::STATUS_OK, &payload)?,
-        Err(e) => {
-            let msg = format!("{:#}", e);
-            query_proto::write_response(&mut stream, query_proto::STATUS_ERR, msg.as_bytes())?;
-        }
-    }
-    Ok(())
-}
-
-fn run_query(sql: &str, stores: &StoreSet) -> anyhow::Result<Vec<u8>> {
-    let trades_rb = stores.snapshot_trades()?;
-    let quotes_rb = stores.snapshot_quotes()?;
-
-    let conn = Connection::open_in_memory()?;
-    conn.register_table_function::<ArrowVTab>("arrow")?;
-
-    // Bind both batches into temporary tables. CREATE TABLE AS materializes
-    // the rows once into DuckDB-managed storage, after which we can run
-    // arbitrary user SQL against `trades` / `quotes`.
-    create_temp_table(&conn, "trades", trades_rb)?;
-    create_temp_table(&conn, "quotes", quotes_rb)?;
-
-    let mut stmt = conn.prepare(sql)?;
-    let arrow_iter = stmt.query_arrow([])?;
-    let result_schema = arrow_iter.get_schema();
-    let batches: Vec<RecordBatch> = arrow_iter.collect();
-    let bytes = encode_ipc_stream(&batches, &result_schema)?;
-    Ok(bytes)
-}
-
-fn create_temp_table(conn: &Connection, name: &str, rb: RecordBatch) -> anyhow::Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS _rollup")?;
     let params = arrow_recordbatch_to_query_params(rb);
-    let sql = format!("CREATE TEMP TABLE {name} AS SELECT * FROM arrow(?, ?)");
-    let mut stmt = conn.prepare(&sql)?;
-    stmt.execute(params)?;
+    conn.prepare("CREATE TEMP TABLE _rollup AS SELECT * FROM arrow(?, ?)")?
+        .execute(params)?;
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM _rollup) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+        out.display()
+    ))?;
+    conn.execute_batch("DROP TABLE IF EXISTS _rollup")?;
     Ok(())
+}
+
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Convert Unix seconds to a `YYYY-MM-DD` string (UTC, no external deps).
+fn unix_secs_to_date(secs: u64) -> String {
+    let z = secs / 86400 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn init_tracing() {

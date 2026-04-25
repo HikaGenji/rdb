@@ -1,14 +1,18 @@
 //! In-memory per-symbol record stores and Arrow snapshots.
 //!
 //! The rdb keeps one [`SymbolStore`] per symbol id. The hot append path
-//! pushes raw fixed-point integers into plain `Vec<T>`s under a per-symbol
+//! pushes raw fixed-point integers into `VecDeque<T>`s under a per-symbol
 //! mutex; the cold query path takes a single lock per symbol, snapshots the
-//! current vectors into an Arrow [`RecordBatch`], and releases the lock.
+//! current deques into an Arrow [`RecordBatch`], and releases the lock.
 //! This trades a copy on the query side for a lock-free hot path on writes.
+//!
+//! When `max_rows > 0`, each column store evicts its oldest row on every
+//! push that would exceed the cap — O(1) via `VecDeque::pop_front`.
 //!
 //! All snapshotting routines decode fixed-point ints to `f64` once, so the
 //! SQL layer sees natural prices/qtys without per-row Decimal handling.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -22,51 +26,80 @@ use tp_types::{QuoteL1, Side, Trade};
 
 #[derive(Default)]
 pub struct TradeColumns {
-    pub seq: Vec<u64>,
-    pub ts_exchange_ns: Vec<u64>,
-    pub ts_local_ns: Vec<u64>,
-    pub price: Vec<i64>,
-    pub qty: Vec<i64>,
-    pub side: Vec<u8>,
+    pub seq: VecDeque<u64>,
+    pub ts_exchange_ns: VecDeque<u64>,
+    pub ts_local_ns: VecDeque<u64>,
+    pub price: VecDeque<i64>,
+    pub qty: VecDeque<i64>,
+    pub side: VecDeque<u8>,
 }
 
 impl TradeColumns {
     pub fn len(&self) -> usize { self.seq.len() }
     pub fn is_empty(&self) -> bool { self.seq.is_empty() }
 
-    pub fn push(&mut self, t: &Trade) {
-        self.seq.push(t.seq);
-        self.ts_exchange_ns.push(t.ts_exchange_ns);
-        self.ts_local_ns.push(t.ts_local_ns);
-        self.price.push(t.price);
-        self.qty.push(t.qty);
-        self.side.push(t.side);
+    /// Append a trade record, evicting the oldest row if `max_rows > 0` and
+    /// the store would exceed that limit.
+    pub fn push(&mut self, t: &Trade, max_rows: usize) {
+        self.seq.push_back(t.seq);
+        self.ts_exchange_ns.push_back(t.ts_exchange_ns);
+        self.ts_local_ns.push_back(t.ts_local_ns);
+        self.price.push_back(t.price);
+        self.qty.push_back(t.qty);
+        self.side.push_back(t.side);
+        if max_rows > 0 && self.seq.len() > max_rows {
+            self.pop_oldest();
+        }
+    }
+
+    fn pop_oldest(&mut self) {
+        self.seq.pop_front();
+        self.ts_exchange_ns.pop_front();
+        self.ts_local_ns.pop_front();
+        self.price.pop_front();
+        self.qty.pop_front();
+        self.side.pop_front();
     }
 }
 
 #[derive(Default)]
 pub struct QuoteColumns {
-    pub seq: Vec<u64>,
-    pub ts_exchange_ns: Vec<u64>,
-    pub ts_local_ns: Vec<u64>,
-    pub bid_price: Vec<i64>,
-    pub bid_qty: Vec<i64>,
-    pub ask_price: Vec<i64>,
-    pub ask_qty: Vec<i64>,
+    pub seq: VecDeque<u64>,
+    pub ts_exchange_ns: VecDeque<u64>,
+    pub ts_local_ns: VecDeque<u64>,
+    pub bid_price: VecDeque<i64>,
+    pub bid_qty: VecDeque<i64>,
+    pub ask_price: VecDeque<i64>,
+    pub ask_qty: VecDeque<i64>,
 }
 
 impl QuoteColumns {
     pub fn len(&self) -> usize { self.seq.len() }
     pub fn is_empty(&self) -> bool { self.seq.is_empty() }
 
-    pub fn push(&mut self, q: &QuoteL1) {
-        self.seq.push(q.seq);
-        self.ts_exchange_ns.push(q.ts_exchange_ns);
-        self.ts_local_ns.push(q.ts_local_ns);
-        self.bid_price.push(q.bid_price);
-        self.bid_qty.push(q.bid_qty);
-        self.ask_price.push(q.ask_price);
-        self.ask_qty.push(q.ask_qty);
+    /// Append a quote record, evicting the oldest row if `max_rows > 0` and
+    /// the store would exceed that limit.
+    pub fn push(&mut self, q: &QuoteL1, max_rows: usize) {
+        self.seq.push_back(q.seq);
+        self.ts_exchange_ns.push_back(q.ts_exchange_ns);
+        self.ts_local_ns.push_back(q.ts_local_ns);
+        self.bid_price.push_back(q.bid_price);
+        self.bid_qty.push_back(q.bid_qty);
+        self.ask_price.push_back(q.ask_price);
+        self.ask_qty.push_back(q.ask_qty);
+        if max_rows > 0 && self.seq.len() > max_rows {
+            self.pop_oldest();
+        }
+    }
+
+    fn pop_oldest(&mut self) {
+        self.seq.pop_front();
+        self.ts_exchange_ns.pop_front();
+        self.ts_local_ns.pop_front();
+        self.bid_price.pop_front();
+        self.bid_qty.pop_front();
+        self.ask_price.pop_front();
+        self.ask_qty.pop_front();
     }
 }
 
@@ -89,6 +122,20 @@ impl SymbolStore {
             quotes: Mutex::new(QuoteColumns::default()),
         }
     }
+}
+
+/// Carries the Arrow snapshots and per-symbol row counts for one rollup cycle.
+///
+/// Pass to [`StoreSet::commit_rollup`] **only after** the Parquet files have
+/// been durably written (and atomically renamed into place). If the write
+/// fails, drop this value — the rows remain in memory for the next cycle.
+pub struct RollupBatch {
+    pub trades: RecordBatch,
+    pub quotes: RecordBatch,
+    /// Number of rows captured per symbol for the `trades` snapshot.
+    trades_counts: Vec<usize>,
+    /// Number of rows captured per symbol for the `quotes` snapshot.
+    quotes_counts: Vec<usize>,
 }
 
 /// All per-symbol stores. Owns the Arrow schemas it materializes.
@@ -188,6 +235,121 @@ impl StoreSet {
         Ok(RecordBatch::try_new(self.quotes_schema.clone(), arrays)?)
     }
 
+    /// Snapshot both live tables for a rollup cycle **without clearing them**.
+    ///
+    /// The returned [`RollupBatch`] carries the Arrow data plus the per-symbol
+    /// row counts captured at snapshot time. Pass it to [`commit_rollup`] once
+    /// the Parquet files have been durably written; that call trims exactly
+    /// those rows from the front of each VecDeque. If writing fails, simply
+    /// drop the `RollupBatch` — the rows remain in memory and will be included
+    /// in the next cycle.
+    pub fn snapshot_for_rollup(&self) -> anyhow::Result<RollupBatch> {
+        // --- trades ---
+        let mut t_symbol = Vec::new();
+        let mut t_symbol_id = Vec::new();
+        let mut t_seq = Vec::new();
+        let mut t_ts_exchange_ns = Vec::new();
+        let mut t_ts_local_ns = Vec::new();
+        let mut t_price = Vec::new();
+        let mut t_qty = Vec::new();
+        let mut t_side = Vec::new();
+        let mut trades_counts = Vec::with_capacity(self.stores.len());
+
+        for store in &self.stores {
+            let cols = store.trades.lock();
+            trades_counts.push(cols.len());
+            for i in 0..cols.len() {
+                t_symbol.push(store.symbol.clone());
+                t_symbol_id.push(store.symbol_id);
+                t_seq.push(cols.seq[i]);
+                t_ts_exchange_ns.push(cols.ts_exchange_ns[i]);
+                t_ts_local_ns.push(cols.ts_local_ns[i]);
+                t_price.push(decode_fixed(cols.price[i], store.price_scale));
+                t_qty.push(decode_fixed(cols.qty[i], store.qty_scale));
+                t_side.push(Side::from_u8(cols.side[i]).as_str().to_string());
+            }
+        }
+        let trades = RecordBatch::try_new(
+            self.trades_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(t_symbol)),
+                Arc::new(UInt32Array::from(t_symbol_id)),
+                Arc::new(UInt64Array::from(t_seq)),
+                Arc::new(UInt64Array::from(t_ts_exchange_ns)),
+                Arc::new(UInt64Array::from(t_ts_local_ns)),
+                Arc::new(Float64Array::from(t_price)),
+                Arc::new(Float64Array::from(t_qty)),
+                Arc::new(StringArray::from(t_side)),
+            ],
+        )?;
+
+        // --- quotes ---
+        let mut q_symbol = Vec::new();
+        let mut q_symbol_id = Vec::new();
+        let mut q_seq = Vec::new();
+        let mut q_ts_exchange_ns = Vec::new();
+        let mut q_ts_local_ns = Vec::new();
+        let mut q_bid_price = Vec::new();
+        let mut q_bid_qty = Vec::new();
+        let mut q_ask_price = Vec::new();
+        let mut q_ask_qty = Vec::new();
+        let mut quotes_counts = Vec::with_capacity(self.stores.len());
+
+        for store in &self.stores {
+            let cols = store.quotes.lock();
+            quotes_counts.push(cols.len());
+            for i in 0..cols.len() {
+                q_symbol.push(store.symbol.clone());
+                q_symbol_id.push(store.symbol_id);
+                q_seq.push(cols.seq[i]);
+                q_ts_exchange_ns.push(cols.ts_exchange_ns[i]);
+                q_ts_local_ns.push(cols.ts_local_ns[i]);
+                q_bid_price.push(decode_fixed(cols.bid_price[i], store.price_scale));
+                q_bid_qty.push(decode_fixed(cols.bid_qty[i], store.qty_scale));
+                q_ask_price.push(decode_fixed(cols.ask_price[i], store.price_scale));
+                q_ask_qty.push(decode_fixed(cols.ask_qty[i], store.qty_scale));
+            }
+        }
+        let quotes = RecordBatch::try_new(
+            self.quotes_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(q_symbol)),
+                Arc::new(UInt32Array::from(q_symbol_id)),
+                Arc::new(UInt64Array::from(q_seq)),
+                Arc::new(UInt64Array::from(q_ts_exchange_ns)),
+                Arc::new(UInt64Array::from(q_ts_local_ns)),
+                Arc::new(Float64Array::from(q_bid_price)),
+                Arc::new(Float64Array::from(q_bid_qty)),
+                Arc::new(Float64Array::from(q_ask_price)),
+                Arc::new(Float64Array::from(q_ask_qty)),
+            ],
+        )?;
+
+        Ok(RollupBatch { trades, quotes, trades_counts, quotes_counts })
+    }
+
+    /// Trim the rows captured by [`snapshot_for_rollup`] from the front of
+    /// every symbol's VecDeque. Call this **only after** the Parquet files
+    /// have been successfully written and renamed into place.
+    ///
+    /// Because ingest appends to the *back* of each deque, trimming the first
+    /// N rows from the *front* removes exactly the snapshot rows without
+    /// touching anything that arrived during the write.
+    pub fn commit_rollup(&self, batch: &RollupBatch) {
+        for (store, &n) in self.stores.iter().zip(&batch.trades_counts) {
+            let mut cols = store.trades.lock();
+            for _ in 0..n.min(cols.len()) {
+                cols.pop_oldest();
+            }
+        }
+        for (store, &n) in self.stores.iter().zip(&batch.quotes_counts) {
+            let mut cols = store.quotes.lock();
+            for _ in 0..n.min(cols.len()) {
+                cols.pop_oldest();
+            }
+        }
+    }
+
     pub fn store_for(&self, symbol_id: u32) -> Option<&Arc<SymbolStore>> {
         self.stores.get(symbol_id as usize)
     }
@@ -262,30 +424,45 @@ mod tests {
         "#).unwrap()
     }
 
-    #[test]
-    fn snapshot_one_trade() {
-        let table = st();
-        let set = StoreSet::from_symbols(&table);
-        let trade = Trade {
-            seq: 1,
+    fn make_trade(seq: u64) -> Trade {
+        Trade {
+            seq,
             ts_exchange_ns: 100,
             ts_local_ns: 200,
             symbol_id: 0,
             _pad0: 0,
-            price: 650005, // 65000.5
-            qty: 10000,    // 1.0
+            price: 650005,
+            qty: 10000,
             side: 0,
             _pad1: [0; 7],
-        };
-        set.stores[0].trades.lock().push(&trade);
+        }
+    }
+
+    #[test]
+    fn snapshot_one_trade() {
+        let set = StoreSet::from_symbols(&st());
+        set.stores[0].trades.lock().push(&make_trade(1), 0);
         let rb = set.snapshot_trades().unwrap();
         assert_eq!(rb.num_rows(), 1);
     }
 
     #[test]
+    fn row_cap_evicts_oldest() {
+        let set = StoreSet::from_symbols(&st());
+        let store = &set.stores[0];
+        for seq in 1..=5 {
+            store.trades.lock().push(&make_trade(seq), 3);
+        }
+        // cap=3: seqs 1,2 should be evicted; 3,4,5 remain
+        let cols = store.trades.lock();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols.seq[0], 3);
+        assert_eq!(cols.seq[2], 5);
+    }
+
+    #[test]
     fn ipc_round_trip() {
-        let table = st();
-        let set = StoreSet::from_symbols(&table);
+        let set = StoreSet::from_symbols(&st());
         let rb = set.snapshot_trades().unwrap();
         let bytes = encode_ipc_stream(&[rb.clone()], &set.trades_schema).unwrap();
         let back = decode_ipc_stream(&bytes).unwrap();
