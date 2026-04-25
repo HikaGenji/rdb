@@ -2,9 +2,9 @@
 //!
 //! Reads a JSONL file (one [`tp_types::FeedEvent`] per line), encodes each
 //! event into a fixed binary [`tp_types::Trade`] / [`tp_types::QuoteL1`],
-//! and publishes to two iceoryx2 services. The `--pace` flag chooses
-//! between firehose mode (publish as fast as possible) and wall-clock
-//! pacing using the `ts_exchange_ns` deltas in the file.
+//! and publishes to two zenoh topics. The `--pace` flag chooses between
+//! firehose mode (publish as fast as possible) and wall-clock pacing using
+//! the `ts_exchange_ns` deltas in the file.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use bytemuck::bytes_of;
 use clap::{Parser, ValueEnum};
-use iceoryx2::prelude::*;
 use tracing::{info, warn};
 
 use tp_config::SymbolTable;
-use tp_types::{ipc_cfg, topics, wall_ns, FeedEvent, QuoteL1, Side, Trade};
+use tp_types::{topics, wall_ns, FeedEvent, QuoteL1, Side, Trade};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Pace {
@@ -45,6 +45,12 @@ struct Args {
     /// Stop after publishing this many events (0 = unbounded).
     #[arg(long, default_value_t = 0)]
     limit: u64,
+
+    /// Zenoh configuration file (JSON5 / YAML). Uses default peer-mode config
+    /// when not supplied. Point to a config with a router endpoint for
+    /// cross-subnet deployments.
+    #[arg(long)]
+    zenoh_config: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -54,26 +60,18 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("loading symbols {}", args.symbols.display()))?;
     info!(symbol_count = symbols.len(), "loaded symbols");
 
-    let node = NodeBuilder::new().create::<ipc::Service>()?;
-    let trades_svc = node
-        .service_builder(&topics::TRADES_RAW.try_into()?)
-        .publish_subscribe::<Trade>()
-        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
-        .history_size(ipc_cfg::HISTORY_SIZE)
-        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
-        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
-        .open_or_create()?;
-    let quotes_svc = node
-        .service_builder(&topics::QUOTES_RAW.try_into()?)
-        .publish_subscribe::<QuoteL1>()
-        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
-        .history_size(ipc_cfg::HISTORY_SIZE)
-        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
-        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
-        .open_or_create()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
 
-    let trade_pub = trades_svc.publisher_builder().create()?;
-    let quote_pub = quotes_svc.publisher_builder().create()?;
+    let zconfig = zenoh_config(&args.zenoh_config)?;
+    let session = rt.block_on(zenoh::open(zconfig))
+        .context("opening zenoh session")?;
+    let trade_pub = rt.block_on(session.declare_publisher(topics::TRADES_RAW))
+        .context("declaring trades publisher")?;
+    let quote_pub = rt.block_on(session.declare_publisher(topics::QUOTES_RAW))
+        .context("declaring quotes publisher")?;
+    info!("zenoh session open");
 
     let file = File::open(&args.input)
         .with_context(|| format!("opening {}", args.input.display()))?;
@@ -125,8 +123,8 @@ fn main() -> anyhow::Result<()> {
                     side: side as u8,
                     _pad1: [0; 7],
                 };
-                let sample = trade_pub.loan_uninit()?.write_payload(trade);
-                sample.send()?;
+                rt.block_on(trade_pub.put(bytes_of(&trade).to_vec()))
+                    .context("publishing trade")?;
                 last_ts_exchange = Some(ts_exchange_ns);
             }
             FeedEvent::Quote { symbol, ts_exchange_ns, bid_price, bid_qty, ask_price, ask_qty } => {
@@ -146,8 +144,8 @@ fn main() -> anyhow::Result<()> {
                     ask_price: symbols.encode_price(symbol_id, ask_price),
                     ask_qty:   symbols.encode_qty(symbol_id, ask_qty),
                 };
-                let sample = quote_pub.loan_uninit()?.write_payload(quote);
-                sample.send()?;
+                rt.block_on(quote_pub.put(bytes_of(&quote).to_vec()))
+                    .context("publishing quote")?;
                 last_ts_exchange = Some(ts_exchange_ns);
             }
         }
@@ -157,10 +155,19 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!(sent, skipped, "feed-replayer finished");
-    // Hold the publishers around briefly so a slow subscriber can drain.
-    std::thread::sleep(Duration::from_millis(50));
-    let _ = Side::Buy; // suppress unused-import warning if Side becomes inlined
+    // Give subscribers a moment to drain the last batch before the session
+    // closes and the zenoh transport tears down.
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = Side::Buy; // suppress unused-import lint
     Ok(())
+}
+
+fn zenoh_config(path: &Option<PathBuf>) -> anyhow::Result<zenoh::Config> {
+    match path {
+        Some(p) => zenoh::Config::from_file(p)
+            .with_context(|| format!("loading zenoh config {}", p.display())),
+        None => Ok(zenoh::Config::default()),
+    }
 }
 
 fn init_tracing() {

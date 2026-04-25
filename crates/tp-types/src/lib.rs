@@ -1,23 +1,20 @@
-//! Wire-format types and shared helpers for the rdb tickerplant prototype.
+//! Wire-format types and shared helpers for the rdb prototype.
 //!
 //! The two record types are POD (`bytemuck::Pod`) and `repr(C)`, with explicit
-//! padding so they can be transmitted byte-for-byte over iceoryx2 shared
-//! memory without per-field serialization. They are also marked
-//! [`iceoryx2::prelude::ZeroCopySend`] so they can be carried by an
-//! iceoryx2 publish/subscribe service.
+//! padding so they can be transmitted byte-for-byte over the network via
+//! zenoh. `bytemuck::bytes_of` serialises them on the publish side;
+//! `bytemuck::try_from_bytes` deserialises them on the subscribe side.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytemuck::{Pod, Zeroable};
-use iceoryx2::prelude::ZeroCopySend;
 use serde::{Deserialize, Serialize};
 
 pub mod metrics;
 pub mod query_proto;
-pub mod ipc_cfg;
 
 pub mod topics {
-    //! Canonical iceoryx2 service names used across the prototype.
+    //! Zenoh key expressions used across the prototype.
     pub const TRADES_RAW: &str = "rdb/trades/raw";
     pub const QUOTES_RAW: &str = "rdb/quotes/raw";
     pub const TRADES_AGG: &str = "rdb/trades/agg";
@@ -59,12 +56,6 @@ pub struct Trade {
     pub _pad1: [u8; 7],
 }
 
-unsafe impl ZeroCopySend for Trade {
-    unsafe fn type_name() -> &'static str {
-        "rdb::Trade::v1"
-    }
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct QuoteL1 {
@@ -77,12 +68,6 @@ pub struct QuoteL1 {
     pub bid_qty: i64,
     pub ask_price: i64,
     pub ask_qty: i64,
-}
-
-unsafe impl ZeroCopySend for QuoteL1 {
-    unsafe fn type_name() -> &'static str {
-        "rdb::QuoteL1::v1"
-    }
 }
 
 /// Returns wall-clock nanos since the unix epoch.

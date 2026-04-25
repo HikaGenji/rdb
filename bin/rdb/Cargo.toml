@@ -24,7 +24,8 @@ tp-types  = { workspace = true }
 tp-config = { workspace = true }
 tp-arrow  = { workspace = true }
 
-iceoryx2           = { workspace = true }
+zenoh              = { workspace = true }
+tokio              = { workspace = true }
 clap               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

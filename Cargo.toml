@@ -24,8 +24,8 @@ tp-config  = { path = "crates/tp-config" }
 tp-arrow   = { path = "crates/tp-arrow" }
 tp-wal     = { path = "crates/tp-wal" }
 
-iceoryx2 = "0.7"
-duckdb   = "1"
+zenoh  = "1"
+duckdb = "1"
 arrow    = "58"
 arrow-array  = "58"
 arrow-schema = "58"
@@ -39,6 +39,7 @@ toml       = "0.8"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap        = { version = "4", features = ["derive"] }
 memmap2     = "0.9"
 crossbeam-channel = "0.5"
