@@ -1,0 +1,262 @@
+//! PostgreSQL wire-protocol gateway for the rdb Unix socket.
+//!
+//! Any client that speaks the Postgres protocol (DBeaver, DataGrip, psql,
+//! Metabase, SQLPad, …) can connect and run SQL queries that are forwarded
+//! to the rdb process via its Unix socket.
+
+use std::fmt::Debug;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Context;
+use arrow_array::{Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+                  StringArray, UInt32Array, UInt64Array};
+use arrow_schema::DataType;
+use async_trait::async_trait;
+use clap::Parser;
+use futures::{stream, Sink};
+use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::copy::NoopCopyHandler;
+use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::PgWireBackendMessage;
+use pgwire::tokio::process_socket;
+use tokio::net::TcpListener;
+
+use tp_arrow::decode_ipc_stream;
+use tp_types::query_proto;
+
+#[derive(Parser)]
+#[command(name = "rdb-pg-gateway", about = "PostgreSQL wire-protocol gateway to the rdb Unix socket")]
+struct Args {
+    /// rdb Unix socket path.
+    #[arg(long, default_value = "/tmp/rdb.sock")]
+    socket: PathBuf,
+
+    /// TCP address to listen on.
+    #[arg(long, default_value = "0.0.0.0:5432")]
+    listen: String,
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+struct RdbHandler {
+    socket_path: PathBuf,
+}
+
+impl RdbHandler {
+    fn new(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+}
+
+// NoopStartupHandler is a trait — implementing it (with no body) accepts any
+// client without authentication.
+impl NoopStartupHandler for RdbHandler {}
+
+fn arrow_to_pg(dt: &DataType) -> Type {
+    match dt {
+        DataType::Boolean => Type::BOOL,
+        DataType::Int8 | DataType::Int16 => Type::INT2,
+        DataType::Int32 => Type::INT4,
+        // UInt32/UInt64 have no unsigned Postgres equivalent; promote to INT8.
+        DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => Type::INT8,
+        DataType::Float32 => Type::FLOAT4,
+        DataType::Float64 => Type::FLOAT8,
+        _ => Type::TEXT,
+    }
+}
+
+fn encode_value(encoder: &mut DataRowEncoder, col: &dyn Array, row: usize) -> PgWireResult<()> {
+    if col.is_null(row) {
+        return encoder.encode_field(&None::<i32>);
+    }
+    match col.data_type() {
+        DataType::Boolean => encoder.encode_field(
+            &col.as_any().downcast_ref::<BooleanArray>().unwrap().value(row),
+        ),
+        DataType::Int32 => encoder.encode_field(
+            &col.as_any().downcast_ref::<Int32Array>().unwrap().value(row),
+        ),
+        DataType::Int64 => encoder.encode_field(
+            &col.as_any().downcast_ref::<Int64Array>().unwrap().value(row),
+        ),
+        DataType::UInt32 => encoder.encode_field(
+            &(col.as_any().downcast_ref::<UInt32Array>().unwrap().value(row) as i64),
+        ),
+        DataType::UInt64 => encoder.encode_field(
+            &(col.as_any().downcast_ref::<UInt64Array>().unwrap().value(row) as i64),
+        ),
+        DataType::Float32 => encoder.encode_field(
+            &col.as_any().downcast_ref::<Float32Array>().unwrap().value(row),
+        ),
+        DataType::Float64 => encoder.encode_field(
+            &col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+        ),
+        DataType::Utf8 => encoder.encode_field(
+            &col.as_any().downcast_ref::<StringArray>().unwrap().value(row),
+        ),
+        dt => {
+            let s = format!("(unhandled: {dt})");
+            encoder.encode_field(&s.as_str())
+        }
+    }
+}
+
+#[async_trait]
+impl SimpleQueryHandler for RdbHandler {
+    async fn do_query<'a, C>(
+        &self,
+        _client: &mut C,
+        query: &'a str,
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // Strip trailing semicolons / whitespace that some clients append.
+        let sql = query.trim().trim_end_matches(';').trim();
+
+        if sql.is_empty() {
+            return Ok(vec![Response::EmptyQuery]);
+        }
+
+        // Intercept PostgreSQL session-management commands that DuckDB ignores.
+        let verb = sql.split_ascii_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        match verb.as_str() {
+            "SET" | "RESET" | "BEGIN" | "COMMIT" | "ROLLBACK" | "DEALLOCATE" => {
+                return Ok(vec![Response::Execution(Tag::new(&verb))]);
+            }
+            _ => {}
+        }
+
+        let socket_path = self.socket_path.clone();
+        let sql_owned = sql.to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut stream = UnixStream::connect(&socket_path).context("connect to rdb socket")?;
+            query_proto::write_request(&mut stream, &sql_owned).context("write request")?;
+            let (status, payload) = query_proto::read_response(&mut stream).context("read response")?;
+            match status {
+                query_proto::STATUS_OK => decode_ipc_stream(&payload).context("decode Arrow IPC"),
+                query_proto::STATUS_ERR => Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&payload))),
+                other => Err(anyhow::anyhow!("unknown rdb status byte {other}")),
+            }
+        })
+        .await
+        .map_err(|e| PgWireError::ApiError(e.into()))?;
+
+        let batches = match result {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(vec![Response::Error(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    e.to_string(),
+                )))]);
+            }
+        };
+
+        if batches.is_empty() {
+            return Ok(vec![Response::Execution(Tag::new("SELECT"))]);
+        }
+
+        let schema = batches[0].schema();
+        let fields: Arc<Vec<FieldInfo>> = Arc::new(
+            schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    FieldInfo::new(
+                        f.name().clone(),
+                        None,
+                        None,
+                        arrow_to_pg(f.data_type()),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect(),
+        );
+
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for row_idx in 0..batch.num_rows() {
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                for col_idx in 0..batch.num_columns() {
+                    encode_value(&mut encoder, batch.column(col_idx).as_ref(), row_idx)?;
+                }
+                rows.push(encoder.finish()?);
+            }
+        }
+
+        let response = QueryResponse::new(fields, stream::iter(rows.into_iter().map(Ok)));
+        Ok(vec![Response::Query(response)])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handler factory
+// ---------------------------------------------------------------------------
+
+struct GatewayFactory {
+    handler: Arc<RdbHandler>,
+}
+
+impl PgWireHandlerFactory for GatewayFactory {
+    type StartupHandler = RdbHandler;
+    type SimpleQueryHandler = RdbHandler;
+    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type CopyHandler = NoopCopyHandler;
+
+    fn startup_handler(&self) -> Arc<Self::StartupHandler> {
+        self.handler.clone()
+    }
+
+    fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
+        self.handler.clone()
+    }
+
+    fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
+        Arc::new(PlaceholderExtendedQueryHandler)
+    }
+
+    fn copy_handler(&self) -> Arc<Self::CopyHandler> {
+        Arc::new(NoopCopyHandler)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    let factory = Arc::new(GatewayFactory {
+        handler: Arc::new(RdbHandler::new(args.socket.clone())),
+    });
+
+    let listener = TcpListener::bind(&args.listen).await?;
+    eprintln!("rdb-pg-gateway: {} → {}", args.listen, args.socket.display());
+
+    loop {
+        let (socket, addr) = listener.accept().await?;
+        let factory = factory.clone();
+        tokio::spawn(async move {
+            if let Err(e) = process_socket(socket, None, factory).await {
+                eprintln!("connection {addr}: {e}");
+            }
+        });
+    }
+}

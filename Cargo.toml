@@ -9,6 +9,7 @@ members = [
     "bin/tickerplant",
     "bin/rdb",
     "bin/query-cli",
+    "bin/pg-gateway",
 ]
 
 [workspace.package]
