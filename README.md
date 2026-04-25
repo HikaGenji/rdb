@@ -1,15 +1,24 @@
-# rdb — Rust tickerplant prototype
+# rdb — Rust market data stack (prototype)
 
-A minimum-viable kdb-style tickerplant for crypto perpetuals, in Rust.
-Architecture: feed handler → tickerplant → in-memory RDB queryable via
-DuckDB-on-Arrow → optional HDB (daily Parquet files). Single host,
-shared-memory transport via [iceoryx2].
+A kdb-style market data platform for crypto perpetuals, in Rust.
+The stack covers the full pipeline from raw feed to long-term queryable
+history, with a standard SQL interface usable from any BI tool:
 
-This is a prototype to validate the architecture, not a production
-system. The hot path is fixed-size POD records over shared memory; the
-SQL layer materializes per-symbol Arrow buffers into a fresh DuckDB
-in-memory database per query and uses the `arrow(?, ?)` table function
-to zero-copy-bind the buffers.
+```
+feed-replayer ─► tickerplant ─► rdb (in-memory) ─►─┐
+                     │                               │ pg-gateway (Postgres wire)
+                     └─► WAL (mmap)           hdb-rollup ─► Parquet files
+```
+
+Transport between processes is zero-copy shared memory ([iceoryx2]).
+Queries are served by DuckDB, operating on Arrow columnar buffers for
+live data and on Parquet files for historical data. The two are
+transparently unioned so clients see a single `trades` / `quotes` table
+spanning any time range.
+
+This is a prototype to validate the architecture. See the
+[Scalability](#scalability) section for an honest account of ceilings
+and known bottlenecks.
 
 [iceoryx2]: https://crates.io/crates/iceoryx2
 
@@ -80,8 +89,7 @@ quotes(symbol Utf8, symbol_id u32, seq u64,
 ```
 
 Queries can use the full DuckDB SQL surface, including `ASOF JOIN` and
-all Parquet predicate-pushdown optimisations when filtering on the
-timestamp columns.
+Parquet predicate-pushdown when filtering on timestamp columns.
 
 ## Historical database (HDB)
 
@@ -117,13 +125,12 @@ To make the rdb serve both live and historical data, pass `--hdb`:
 
 Clients that only ever queried `trades` or `quotes` see no change — they
 now transparently get rows from all historical Parquet files plus today's
-in-memory data. To query only live data, use `trades_live`; to query
-only history, use `trades_hist`.
+in-memory data. To query only live data use `trades_live`; to query
+only history use `trades_hist`.
 
 Example multi-day query:
 
 ```sql
--- Executes via psql, rdb-query, DBeaver, etc.
 SELECT symbol,
        date_trunc('day', to_timestamp(ts_exchange_ns / 1e9)) AS day,
        COUNT(*)                                               AS n,
@@ -173,6 +180,72 @@ handler). Each downstream stage records `now() - ts_local_ns` into a
 sliding-window histogram and emits `p50_ns`, `p99_ns` once a second on
 stderr (JSON via `tracing-subscriber`). Drop counters are kept but the
 prototype only logs them; backpressure beyond that is out of scope.
+
+## Scalability
+
+### What scales well
+
+| Dimension | Assessment |
+|---|---|
+| **Ingest throughput** | iceoryx2 shared memory is zero-copy and sub-µs; millions of events/sec is realistic on a single host. The tickerplant and rdb ingest paths are decoupled — queries never stall ingestion beyond a brief per-symbol snapshot lock. |
+| **HDB query analytics** | DuckDB on Parquet is a genuine OLAP engine. Multi-year history with billions of rows is queryable in seconds on a single machine, especially with column pruning and timestamp predicate pushdown within row groups. |
+| **Operational simplicity** | No external dependencies (no Kafka, no Postgres, no object store). The full pipeline runs in five processes on one machine. |
+
+### Known ceilings and bottlenecks
+
+**Single host — hard limit.**
+iceoryx2 uses OS shared memory; it cannot span network boundaries.
+Every process in the pipeline must run on the same machine. Horizontal
+scaling requires replacing the transport layer with something
+network-capable (Aeron, Chronicle, NATS, …).
+
+**Per-query DuckDB spin-up.**
+`run_query` opens a fresh `Connection::open_in_memory()`, registers the
+Arrow virtual table, and materialises two temp tables on every single
+query — including trivial ones. This is 1–5 ms of overhead before the
+SQL even runs. Under concurrent interactive load (dozens of BI tool
+queries at once) this overhead multiplies and each query also takes a
+full snapshot lock across all symbols. A persistent DuckDB connection
+with pre-registered views would eliminate this overhead.
+
+**Unbounded RDB memory.**
+The in-memory store grows without eviction until EOD rollup. At 10 k
+trades/min across 3 symbols that is roughly 100 MB/day — manageable.
+At 100 symbols or tick-by-tick L2 data it can reach tens of GB before
+midnight. There is no per-symbol memory cap or intra-day spill path.
+
+**HDB glob reads all files.**
+`read_parquet('trades/*.parquet')` opens every Parquet file in the
+directory regardless of date predicates. DuckDB can skip row groups
+within a file via statistics, but it cannot skip entire files without
+Hive-style directory partitioning
+(`trades/date=2024-01-15/data.parquet`). At ~365 files per year this is
+fine; at multi-year history the file-open overhead becomes noticeable.
+The fix is to switch to Hive partitioning in `hdb-rollup` and use
+`read_parquet('trades/**/*.parquet', hive_partitioning=true)` in the
+rdb.
+
+**Fixed symbol set.**
+Symbols are loaded from TOML at startup and assigned fixed integer ids.
+Adding a symbol requires restarting the rdb (and losing in-memory data).
+
+**pg-gateway: one round-trip per query.**
+The gateway opens a new Unix socket connection for every query and waits
+for the full response before returning. There is no pipelining or
+connection multiplexing to the rdb. This is fine for interactive BI
+tools; it is unsuitable for high-frequency programmatic querying.
+
+### Scaling path (if this were to grow)
+
+1. Replace iceoryx2 with a network transport (Aeron or Chronicle) to
+   allow multi-host fan-out.
+2. Shard the rdb by symbol group so each instance fits in RAM.
+3. Switch to a persistent DuckDB connection with pre-registered Arrow
+   views instead of per-query spin-up.
+4. Add Hive partitioning to the HDB (`date=…/symbol=…/data.parquet`) for
+   file-skip on both dimensions.
+5. Add a rollup trigger or WAL-replay path so intra-day data can be
+   partially flushed to Parquet without restarting the rdb.
 
 ## Running it
 
