@@ -108,10 +108,13 @@ fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Res
         return Ok(());
     }
 
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating directory {}", dir.display()))?;
-
-    let out_path = dir.join(format!("{date}.parquet"));
+    // Hive layout: date=YYYY-MM-DD/data.parquet
+    // rdb mounts these with hive_partitioning=true so DuckDB can skip whole
+    // date directories when a query filters on the synthetic `date` column.
+    let partition_dir = dir.join(format!("date={date}"));
+    std::fs::create_dir_all(&partition_dir)
+        .with_context(|| format!("creating {}", partition_dir.display()))?;
+    let out_path = partition_dir.join("data.parquet");
 
     // Merge all batches into one so DuckDB COPY sees a single relation.
     let schema = batches[0].schema();
