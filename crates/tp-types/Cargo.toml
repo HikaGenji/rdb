@@ -1,0 +1,10 @@
+[package]
+name = "tp-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true }
+iceoryx2 = { workspace = true }
+serde    = { workspace = true }

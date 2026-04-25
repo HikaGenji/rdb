@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tp-types",
+    "crates/tp-config",
+    "crates/tp-arrow",
+    "crates/tp-wal",
+    "bin/feed-replayer",
+    "bin/tickerplant",
+    "bin/rdb",
+    "bin/query-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tp-types   = { path = "crates/tp-types" }
+tp-config  = { path = "crates/tp-config" }
+tp-arrow   = { path = "crates/tp-arrow" }
+tp-wal     = { path = "crates/tp-wal" }
+
+iceoryx2 = "0.7"
+duckdb   = "1"
+arrow    = "58"
+arrow-array  = "58"
+arrow-schema = "58"
+arrow-ipc    = "58"
+
+bytemuck = { version = "1", features = ["derive"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+clap        = { version = "4", features = ["derive"] }
+memmap2     = "0.9"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+anyhow      = "1"
+thiserror   = "1"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+debug         = 1

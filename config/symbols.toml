@@ -1,0 +1,17 @@
+# Symbol table loaded by every process at startup.
+# The order in this file defines the symbol id (BTC-PERP=0, ETH-PERP=1, ...).
+
+[[symbol]]
+symbol = "BTC-PERP"
+price_scale = 1
+qty_scale = 4
+
+[[symbol]]
+symbol = "ETH-PERP"
+price_scale = 2
+qty_scale = 4
+
+[[symbol]]
+symbol = "SOL-PERP"
+price_scale = 3
+qty_scale = 4

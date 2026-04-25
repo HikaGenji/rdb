@@ -1,0 +1,38 @@
+[package]
+name = "rdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rdb"
+path = "src/main.rs"
+
+[[test]]
+name = "end_to_end"
+path = "tests/end_to_end.rs"
+
+[dev-dependencies]
+tp-types = { workspace = true }
+tp-arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+anyhow = { workspace = true }
+
+[dependencies]
+tp-types  = { workspace = true }
+tp-config = { workspace = true }
+tp-arrow  = { workspace = true }
+
+iceoryx2           = { workspace = true }
+clap               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+parking_lot        = { workspace = true }
+crossbeam-channel  = { workspace = true }
+duckdb             = { workspace = true, features = ["vtab-arrow", "bundled"] }
+arrow              = { workspace = true }
+arrow-array        = { workspace = true }
+arrow-schema       = { workspace = true }
+arrow-ipc          = { workspace = true }
