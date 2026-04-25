@@ -82,6 +82,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     row_cap: usize,
 
+    /// Intra-day rollup interval in seconds. When > 0 and --hdb is set, a
+    /// background thread wakes every N seconds, snapshots and clears the live
+    /// stores, and writes the rows to a dated Parquet chunk in the HDB
+    /// directory. This bounds peak memory without relying on --row-cap
+    /// eviction, which silently drops rows.  0 = disabled.
+    #[arg(long, default_value_t = 0)]
+    rollup_interval_secs: u64,
+
     /// Idle sleep in the ingest loop (microseconds).
     #[arg(long, default_value_t = 200)]
     idle_sleep_us: u64,
@@ -127,6 +135,23 @@ fn main() -> anyhow::Result<()> {
     let pool = ConnPool::new(args.query_workers)
         .context("initialising DuckDB connection pool")?;
     info!(workers = args.query_workers, "DuckDB connection pool ready");
+
+    if args.rollup_interval_secs > 0 {
+        match &hdb_dir {
+            Some(hdb) => {
+                let stores_r = stores.clone();
+                let hdb_r = hdb.clone();
+                let interval_secs = args.rollup_interval_secs;
+                std::thread::Builder::new()
+                    .name("rdb-rollup".into())
+                    .spawn(move || run_rollup_thread(stores_r, hdb_r, interval_secs))?;
+                info!(interval_secs, "intra-day rollup thread started");
+            }
+            None => {
+                warn!("--rollup-interval-secs ignored: --hdb not set");
+            }
+        }
+    }
 
     let stores_q = stores.clone();
     let _query_thread = std::thread::Builder::new()
@@ -424,6 +449,91 @@ fn run_ingest_loop(
         "rdb final stats"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Intra-day rollup thread
+// ---------------------------------------------------------------------------
+
+fn run_rollup_thread(stores: Arc<StoreSet>, hdb_dir: Arc<PathBuf>, interval_secs: u64) {
+    let conn = match Connection::open_in_memory() {
+        Ok(c) => c,
+        Err(e) => { error!(error = %e, "rollup: failed to open DuckDB connection"); return; }
+    };
+    if let Err(e) = conn.register_table_function::<ArrowVTab>("arrow") {
+        error!(error = %e, "rollup: failed to register ArrowVTab"); return;
+    }
+
+    let interval = Duration::from_secs(interval_secs);
+    loop {
+        std::thread::sleep(interval);
+
+        let ts_secs = unix_secs_now();
+        let date = unix_secs_to_date(ts_secs);
+
+        let trades_rb = match stores.snapshot_and_clear_trades() {
+            Ok(rb) => rb,
+            Err(e) => { error!(error = %e, "rollup: trades snapshot failed"); continue; }
+        };
+        let quotes_rb = match stores.snapshot_and_clear_quotes() {
+            Ok(rb) => rb,
+            Err(e) => { error!(error = %e, "rollup: quotes snapshot failed"); continue; }
+        };
+
+        for (table, rb) in [("trades", trades_rb), ("quotes", quotes_rb)] {
+            if rb.num_rows() == 0 {
+                continue;
+            }
+            let out = hdb_dir
+                .join(table)
+                .join(format!("date={date}"))
+                .join(format!("{ts_secs}.parquet"));
+            match rollup_write_parquet(&conn, rb, &out) {
+                Ok(()) => info!(rows = %out.display(), "rollup: chunk written"),
+                Err(e) => error!(error = %e, path = %out.display(), "rollup: write failed"),
+            }
+        }
+    }
+}
+
+/// Write a `RecordBatch` to a Parquet file using the rollup thread's
+/// persistent DuckDB connection.
+fn rollup_write_parquet(conn: &Connection, rb: RecordBatch, out: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(out.parent().context("invalid path")?)
+        .with_context(|| format!("creating dir for {}", out.display()))?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS _rollup")?;
+    let params = arrow_recordbatch_to_query_params(rb);
+    conn.prepare("CREATE TEMP TABLE _rollup AS SELECT * FROM arrow(?, ?)")?
+        .execute(params)?;
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM _rollup) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+        out.display()
+    ))?;
+    conn.execute_batch("DROP TABLE IF EXISTS _rollup")?;
+    Ok(())
+}
+
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Convert Unix seconds to a `YYYY-MM-DD` string (UTC, no external deps).
+fn unix_secs_to_date(secs: u64) -> String {
+    let z = secs / 86400 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn init_tracing() {

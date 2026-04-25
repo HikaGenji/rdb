@@ -221,6 +221,92 @@ impl StoreSet {
         Ok(RecordBatch::try_new(self.quotes_schema.clone(), arrays)?)
     }
 
+    /// Snapshot all live trades into a `RecordBatch` **and immediately clear
+    /// every symbol's store** while holding the per-symbol lock.
+    ///
+    /// Rows that arrive on the ingest thread between two successive symbol
+    /// locks land in the now-empty store and will be captured in the next
+    /// rollup — no data is lost as long as writing the resulting Parquet file
+    /// succeeds before the next call.
+    pub fn snapshot_and_clear_trades(&self) -> anyhow::Result<RecordBatch> {
+        let mut symbol = Vec::new();
+        let mut symbol_id = Vec::new();
+        let mut seq = Vec::new();
+        let mut ts_exchange_ns = Vec::new();
+        let mut ts_local_ns = Vec::new();
+        let mut price = Vec::new();
+        let mut qty = Vec::new();
+        let mut side = Vec::new();
+
+        for store in &self.stores {
+            let mut cols = store.trades.lock();
+            for i in 0..cols.len() {
+                symbol.push(store.symbol.clone());
+                symbol_id.push(store.symbol_id);
+                seq.push(cols.seq[i]);
+                ts_exchange_ns.push(cols.ts_exchange_ns[i]);
+                ts_local_ns.push(cols.ts_local_ns[i]);
+                price.push(decode_fixed(cols.price[i], store.price_scale));
+                qty.push(decode_fixed(cols.qty[i], store.qty_scale));
+                side.push(Side::from_u8(cols.side[i]).as_str().to_string());
+            }
+            *cols = TradeColumns::default();
+        }
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(symbol)),
+            Arc::new(UInt32Array::from(symbol_id)),
+            Arc::new(UInt64Array::from(seq)),
+            Arc::new(UInt64Array::from(ts_exchange_ns)),
+            Arc::new(UInt64Array::from(ts_local_ns)),
+            Arc::new(Float64Array::from(price)),
+            Arc::new(Float64Array::from(qty)),
+            Arc::new(StringArray::from(side)),
+        ];
+        Ok(RecordBatch::try_new(self.trades_schema.clone(), arrays)?)
+    }
+
+    /// Snapshot all live quotes **and immediately clear every symbol's store**.
+    /// See [`snapshot_and_clear_trades`] for the consistency model.
+    pub fn snapshot_and_clear_quotes(&self) -> anyhow::Result<RecordBatch> {
+        let mut symbol = Vec::new();
+        let mut symbol_id = Vec::new();
+        let mut seq = Vec::new();
+        let mut ts_exchange_ns = Vec::new();
+        let mut ts_local_ns = Vec::new();
+        let mut bid_price = Vec::new();
+        let mut bid_qty = Vec::new();
+        let mut ask_price = Vec::new();
+        let mut ask_qty = Vec::new();
+
+        for store in &self.stores {
+            let mut cols = store.quotes.lock();
+            for i in 0..cols.len() {
+                symbol.push(store.symbol.clone());
+                symbol_id.push(store.symbol_id);
+                seq.push(cols.seq[i]);
+                ts_exchange_ns.push(cols.ts_exchange_ns[i]);
+                ts_local_ns.push(cols.ts_local_ns[i]);
+                bid_price.push(decode_fixed(cols.bid_price[i], store.price_scale));
+                bid_qty.push(decode_fixed(cols.bid_qty[i], store.qty_scale));
+                ask_price.push(decode_fixed(cols.ask_price[i], store.price_scale));
+                ask_qty.push(decode_fixed(cols.ask_qty[i], store.qty_scale));
+            }
+            *cols = QuoteColumns::default();
+        }
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(symbol)),
+            Arc::new(UInt32Array::from(symbol_id)),
+            Arc::new(UInt64Array::from(seq)),
+            Arc::new(UInt64Array::from(ts_exchange_ns)),
+            Arc::new(UInt64Array::from(ts_local_ns)),
+            Arc::new(Float64Array::from(bid_price)),
+            Arc::new(Float64Array::from(bid_qty)),
+            Arc::new(Float64Array::from(ask_price)),
+            Arc::new(Float64Array::from(ask_qty)),
+        ];
+        Ok(RecordBatch::try_new(self.quotes_schema.clone(), arrays)?)
+    }
+
     pub fn store_for(&self, symbol_id: u32) -> Option<&Arc<SymbolStore>> {
         self.stores.get(symbol_id as usize)
     }
