@@ -199,32 +199,6 @@ Every process in the pipeline must run on the same machine. Horizontal
 scaling requires replacing the transport layer with something
 network-capable (Aeron, Chronicle, NATS, …).
 
-**Per-query DuckDB spin-up.**
-`run_query` opens a fresh `Connection::open_in_memory()`, registers the
-Arrow virtual table, and materialises two temp tables on every single
-query — including trivial ones. This is 1–5 ms of overhead before the
-SQL even runs. Under concurrent interactive load (dozens of BI tool
-queries at once) this overhead multiplies and each query also takes a
-full snapshot lock across all symbols. A persistent DuckDB connection
-with pre-registered views would eliminate this overhead.
-
-**Unbounded RDB memory.**
-The in-memory store grows without eviction until EOD rollup. At 10 k
-trades/min across 3 symbols that is roughly 100 MB/day — manageable.
-At 100 symbols or tick-by-tick L2 data it can reach tens of GB before
-midnight. There is no per-symbol memory cap or intra-day spill path.
-
-**HDB glob reads all files.**
-`read_parquet('trades/*.parquet')` opens every Parquet file in the
-directory regardless of date predicates. DuckDB can skip row groups
-within a file via statistics, but it cannot skip entire files without
-Hive-style directory partitioning
-(`trades/date=2024-01-15/data.parquet`). At ~365 files per year this is
-fine; at multi-year history the file-open overhead becomes noticeable.
-The fix is to switch to Hive partitioning in `hdb-rollup` and use
-`read_parquet('trades/**/*.parquet', hive_partitioning=true)` in the
-rdb.
-
 **Fixed symbol set.**
 Symbols are loaded from TOML at startup and assigned fixed integer ids.
 Adding a symbol requires restarting the rdb (and losing in-memory data).
@@ -235,25 +209,47 @@ for the full response before returning. There is no pipelining or
 connection multiplexing to the rdb. This is fine for interactive BI
 tools; it is unsuitable for high-frequency programmatic querying.
 
-### Scaling path (if this were to grow)
+### Addressed bottlenecks
+
+**Per-query DuckDB spin-up → connection pool.**
+The rdb now maintains a pool of `--query-workers` (default 4) persistent
+DuckDB connections. Each connection is initialised once (open +
+ArrowVTab registration). Per query, only the live temp tables are
+dropped and recreated from a fresh Arrow snapshot; HDB Parquet metadata
+stays cached in the connection across queries. Concurrent queries beyond
+the pool size queue rather than spin up new connections.
+
+**Unbounded RDB memory → O(1) row-cap eviction.**
+`--row-cap N` (default 0 = unlimited) sets a per-symbol row limit.
+Column stores use `VecDeque<T>` so evicting the oldest row on each push
+that exceeds the cap is O(1). At cap=500 000 rows per symbol, a
+3-symbol deployment keeps ≈ 200 MB in RAM regardless of session length.
+
+**HDB glob reads all files → Hive partitioning.**
+`hdb-rollup` now writes `<hdb>/trades/date=YYYY-MM-DD/data.parquet`.
+The rdb mounts history with `read_parquet('…/**/*.parquet',
+hive_partitioning=true)` so DuckDB can skip whole date directories when
+a query carries a date predicate. The synthetic `date` column is stripped
+via `SELECT * EXCLUDE (date)` so `trades_hist` stays schema-identical to
+`trades_live` and the `UNION ALL` in `trades` works without casting.
+
+### Remaining scaling path
 
 1. Replace iceoryx2 with a network transport (Aeron or Chronicle) to
-   allow multi-host fan-out.
-2. Shard the rdb by symbol group so each instance fits in RAM.
-3. Switch to a persistent DuckDB connection with pre-registered Arrow
-   views instead of per-query spin-up.
-4. Add Hive partitioning to the HDB (`date=…/symbol=…/data.parquet`) for
-   file-skip on both dimensions.
-5. Add a rollup trigger or WAL-replay path so intra-day data can be
-   partially flushed to Parquet without restarting the rdb.
+   allow multi-host fan-out and symbol sharding.
+2. Add symbol-level Hive partitioning to the HDB
+   (`date=…/symbol=…/data.parquet`) for file-skip on both axes.
+3. Add an intra-day spill path so the rdb can partially flush to Parquet
+   without restarting (needed once row-cap eviction is unacceptable).
 
 ## Running it
 
 ```bash
 cargo build --release
 
-# Terminal 1 — start the rdb (with optional HDB).
-./target/release/rdb --symbols config/symbols.toml --hdb ./hdb
+# Terminal 1 — start the rdb (with optional HDB, 4-worker pool, 500k row cap).
+./target/release/rdb --symbols config/symbols.toml --hdb ./hdb \
+    --query-workers 4 --row-cap 500000
 
 # Terminal 2 — start the tickerplant.
 ./target/release/tickerplant --symbols config/symbols.toml \
