@@ -233,14 +233,23 @@ a query carries a date predicate. The synthetic `date` column is stripped
 via `SELECT * EXCLUDE (date)` so `trades_hist` stays schema-identical to
 `trades_live` and the `UNION ALL` in `trades` works without casting.
 
+**Unbounded intra-day growth → periodic intra-day rollup.**
+`--rollup-interval-secs N` starts a background thread that wakes every N
+seconds, snapshots the live stores without clearing, writes each table to
+a `.parquet.tmp` file, atomically renames it into place, then trims
+exactly the snapshotted rows from the front of each VecDeque. If the
+write fails the rows are retained for the next cycle — no data loss.
+Intra-day chunks land in the same Hive layout (`date=YYYY-MM-DD/<ts>.parquet`)
+and are transparently unioned with EoD chunks by the `trades_hist` view.
+
 ### Remaining scaling path
 
 1. Replace iceoryx2 with a network transport (Aeron or Chronicle) to
    allow multi-host fan-out and symbol sharding.
 2. Add symbol-level Hive partitioning to the HDB
    (`date=…/symbol=…/data.parquet`) for file-skip on both axes.
-3. Add an intra-day spill path so the rdb can partially flush to Parquet
-   without restarting (needed once row-cap eviction is unacceptable).
+3. Add a retention policy so intra-day rollup chunks older than N days
+   are automatically pruned from the HDB directory.
 
 ## Running it
 
