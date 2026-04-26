@@ -2,19 +2,25 @@
 //!
 //! Connects to a running `rdb` process via its Unix socket, fetches the
 //! current in-memory `trades_live` and `quotes_live` tables as Arrow IPC,
-//! and writes them as Parquet files under the target HDB directory:
+//! and writes them as Parquet files under the target HDB directory with
+//! two-level Hive partitioning:
 //!
 //! ```text
 //! <hdb-dir>/
-//!   trades/date=YYYY-MM-DD/data.parquet
-//!   quotes/date=YYYY-MM-DD/data.parquet
+//!   trades/date=YYYY-MM-DD/symbol=BTC-PERP/data.parquet
+//!   trades/date=YYYY-MM-DD/symbol=ETH-PERP/data.parquet
+//!   quotes/date=YYYY-MM-DD/symbol=BTC-PERP/data.parquet
+//!   quotes/date=YYYY-MM-DD/symbol=ETH-PERP/data.parquet
+//!   …
 //! ```
 //!
-//! The Hive-partitioned layout lets DuckDB skip whole date directories when
-//! a query carries a date predicate. The `rdb` binary mounts history with
-//! `read_parquet('…/**/*.parquet', hive_partitioning=true)` and strips the
-//! synthetic `date` column so `trades_hist` stays schema-identical to
-//! `trades_live`.
+//! The two-level Hive layout lets DuckDB skip whole date directories on date
+//! predicates **and** skip individual symbol directories on symbol predicates.
+//! The `symbol` value is encoded purely in the directory name; it is omitted
+//! from the Parquet file itself to avoid a column-name conflict when DuckDB
+//! reads with `hive_partitioning=true`. The `rdb` binary mounts history with
+//! `read_parquet('…/**/*.parquet', hive_partitioning=true)` and selects
+//! columns by name so `trades_hist` stays schema-identical to `trades_live`.
 //!
 //! Typical usage (run at midnight or end of trading session):
 //!
@@ -104,21 +110,18 @@ fn fetch(socket: &Path, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
 // Parquet writer
 // ---------------------------------------------------------------------------
 
+/// Write `batches` to per-symbol Parquet files under
+/// `<dir>/date=<date>/symbol=<sym>/data.parquet`.
+///
+/// Each file omits the `symbol` column; it is encoded in the directory name
+/// so DuckDB can apply file-skip on both the `date` and `symbol` axes when
+/// reading with `hive_partitioning=true`.
 fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Result<()> {
     if batches.is_empty() || total_rows(batches) == 0 {
         eprintln!("  skipping empty table for {}", dir.display());
         return Ok(());
     }
 
-    // Hive layout: date=YYYY-MM-DD/data.parquet
-    // rdb mounts these with hive_partitioning=true so DuckDB can skip whole
-    // date directories when a query filters on the synthetic `date` column.
-    let partition_dir = dir.join(format!("date={date}"));
-    std::fs::create_dir_all(&partition_dir)
-        .with_context(|| format!("creating {}", partition_dir.display()))?;
-    let out_path = partition_dir.join("data.parquet");
-
-    // Merge all batches into one so DuckDB COPY sees a single relation.
     let schema = batches[0].schema();
     let merged = concat_batches(&schema, batches).context("concat batches")?;
 
@@ -129,15 +132,30 @@ fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Res
     let mut stmt = conn.prepare("CREATE TEMP TABLE _data AS SELECT * FROM arrow(?, ?)")?;
     stmt.execute(params)?;
 
-    // DuckDB writes Parquet natively; ZSTD gives a good size/speed tradeoff.
-    let copy_sql = format!(
-        "COPY (SELECT * FROM _data) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-        out_path.display()
-    );
-    conn.execute_batch(&copy_sql)
-        .with_context(|| format!("writing {}", out_path.display()))?;
+    let mut sym_stmt = conn.prepare("SELECT DISTINCT symbol FROM _data ORDER BY symbol")?;
+    let symbols: Vec<String> = sym_stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
 
-    eprintln!("  wrote {}", out_path.display());
+    for sym in &symbols {
+        // Hive layout: date=YYYY-MM-DD/symbol=<sym>/data.parquet
+        let sym_dir = dir.join(format!("date={date}")).join(format!("symbol={sym}"));
+        std::fs::create_dir_all(&sym_dir)
+            .with_context(|| format!("creating {}", sym_dir.display()))?;
+        let out_path = sym_dir.join("data.parquet");
+
+        // Exclude `symbol` from the file; it is already encoded in the path.
+        let copy_sql = format!(
+            "COPY (SELECT * EXCLUDE (symbol) FROM _data WHERE symbol = {}) \
+             TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+            sql_quote(sym),
+            out_path.display()
+        );
+        conn.execute_batch(&copy_sql)
+            .with_context(|| format!("writing {}", out_path.display()))?;
+        eprintln!("  wrote {}", out_path.display());
+    }
+
     Ok(())
 }
 
@@ -147,6 +165,11 @@ fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Res
 
 fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
+}
+
+/// Wrap `s` in single quotes, escaping any embedded single quotes.
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 fn today_utc() -> String {

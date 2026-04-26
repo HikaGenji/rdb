@@ -82,7 +82,7 @@ The rdb exposes three table tiers for each dataset:
 ```text
 trades_live   today's in-memory rows (always present)
 trades_hist   read_parquet('<hdb-dir>/trades/**/*.parquet',
-              hive_partitioning=true) — synthetic date column excluded
+              hive_partitioning=true) — date=…/symbol=… resolved from path
               (present when --hdb is set and at least one file exists)
 trades        UNION ALL of trades_live + trades_hist
               (plain alias for trades_live when --hdb is not set)
@@ -118,20 +118,22 @@ live tables to Parquet:
 ./target/release/hdb-rollup --hdb-dir ./hdb --date 2024-01-15
 ```
 
-This writes Hive-partitioned files:
+This writes two-level Hive-partitioned files:
 
 ```
 hdb/
-  trades/date=2024-01-15/data.parquet
-  trades/date=2024-01-16/data.parquet
-  quotes/date=2024-01-15/data.parquet
-  quotes/date=2024-01-16/data.parquet
+  trades/date=2024-01-15/symbol=BTC-PERP/data.parquet
+  trades/date=2024-01-15/symbol=ETH-PERP/data.parquet
+  trades/date=2024-01-16/symbol=BTC-PERP/data.parquet
+  quotes/date=2024-01-15/symbol=BTC-PERP/data.parquet
   …
 ```
 
-Each file is ZSTD-compressed. The `date=…` directory names are Hive partition
-keys; DuckDB uses them to skip whole directories when a query carries a date
-predicate.
+Each file is ZSTD-compressed. The `date=…/symbol=…` directory names are Hive
+partition keys; DuckDB uses them to skip whole directories when a query carries
+a date or symbol predicate (file-skip on both axes). The `symbol` value is
+encoded only in the path — it is omitted from the Parquet file itself to avoid
+a column-name conflict with the Hive partition key.
 
 To make the rdb serve both live and historical data, pass `--hdb`:
 
@@ -241,21 +243,22 @@ Column stores use `VecDeque<T>` so evicting the oldest row on each push
 that exceeds the cap is O(1). At cap=500 000 rows per symbol, a
 3-symbol deployment keeps ≈ 200 MB in RAM regardless of session length.
 
-**HDB glob reads all files → Hive partitioning.**
-`hdb-rollup` now writes `<hdb>/trades/date=YYYY-MM-DD/data.parquet`.
+**HDB glob reads all files → two-level Hive partitioning.**
+`hdb-rollup` writes `<hdb>/trades/date=YYYY-MM-DD/symbol=<sym>/data.parquet`.
 The rdb mounts history with `read_parquet('…/**/*.parquet',
-hive_partitioning=true)` so DuckDB can skip whole date directories when
-a query carries a date predicate. The synthetic `date` column is stripped
-via `SELECT * EXCLUDE (date)` so `trades_hist` stays schema-identical to
-`trades_live` and the `UNION ALL` in `trades` works without casting.
+hive_partitioning=true)`. DuckDB resolves `date` and `symbol` from the
+directory names, enabling file-skip on both axes. `trades_hist` selects
+columns by name (not `SELECT *`) so the schema is stable regardless of
+Parquet column order and stays union-compatible with `trades_live`.
 
 **Row-cap eviction as only flush path → intra-day rollup.**
 `--rollup-interval-secs N` (requires `--hdb`) spawns a background thread
 that every N seconds snapshots and clears the in-memory stores, writing
-each non-empty batch to `<hdb>/<table>/date=YYYY-MM-DD/<unix_ts>.parquet`
-using the same Hive layout. With a 5-minute interval the stores never
-grow beyond one interval's worth of rows; `--row-cap` becomes a last-resort
-safety net rather than the primary eviction mechanism.
+per-symbol chunks to
+`<hdb>/<table>/date=YYYY-MM-DD/symbol=<sym>/<unix_ts>.parquet`
+using the same two-level Hive layout. With a 5-minute interval the stores
+never grow beyond one interval's worth of rows; `--row-cap` becomes a
+last-resort safety net rather than the primary eviction mechanism.
 
 **Single-host iceoryx2 → cross-host zenoh bridge.**
 `zenoh-bridge` forwards the tickerplant's `*/agg` output to remote rdb
@@ -264,9 +267,6 @@ existing binary. Same-host paths stay on iceoryx2 shared memory. See
 [Multi-host deployment](#multi-host-deployment-zenoh-bridge) below.
 
 ### Remaining scaling path
-
-1. Add symbol-level Hive partitioning to the HDB
-   (`date=…/symbol=…/data.parquet`) for file-skip on both axes.
 
 ## Running it
 
