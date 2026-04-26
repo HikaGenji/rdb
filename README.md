@@ -30,6 +30,9 @@ This is a prototype to validate the architecture. See the
 [Scalability](#scalability) section for an honest account of ceilings
 and known bottlenecks.
 
+New here? [TUTORIAL.md](TUTORIAL.md) walks through installation and a
+full single-host run end-to-end.
+
 [iceoryx2]: https://crates.io/crates/iceoryx2
 
 ## Layout
