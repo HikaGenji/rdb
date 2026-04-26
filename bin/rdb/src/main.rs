@@ -24,12 +24,12 @@
 //! ## HDB views
 //!
 //! When `--hdb <dir>` is supplied, Parquet files written by `hdb-rollup`
-//! are mounted at query time using Hive partitioning:
+//! are mounted at query time using two-level Hive partitioning:
 //!
 //! ```text
 //! trades_live  – today's in-memory rows
 //! trades_hist  – read_parquet('<dir>/trades/**/*.parquet', hive_partitioning=true)
-//!                (if any files exist; date column stripped to match live schema)
+//!                (if any files exist; date=…/symbol=… resolved from path)
 //! trades       – UNION ALL of the two above
 //! quotes_live / quotes_hist / quotes – same pattern
 //! ```
@@ -303,14 +303,18 @@ fn build_union_view(name: &str, hdb_dir: Option<&Path>) -> String {
         .unwrap_or(false);
 
     if has_hist {
-        // Hive layout: <hdb>/<name>/date=YYYY-MM-DD/data.parquet
-        // `hive_partitioning=true` lets DuckDB skip whole date directories
-        // on predicate pushdown. `EXCLUDE (date)` drops the synthetic Hive
-        // partition column so the schema matches the live table exactly.
+        // Two-level Hive layout: <hdb>/<name>/date=YYYY-MM-DD/symbol=<sym>/
+        // `hive_partitioning=true` lets DuckDB skip entire date or symbol
+        // directories based on query predicates (file-skip on both axes).
+        // `symbol` and `date` come from the path; all other columns come from
+        // the file. Selecting columns explicitly by name keeps the schema
+        // stable regardless of column order in the Parquet files and makes
+        // the UNION ALL with the live table unambiguous.
         let glob = hdb_dir.unwrap().join(name).join("**").join("*.parquet");
+        let cols = hist_columns(name);
         format!(
             "CREATE VIEW {name}_hist AS \
-               SELECT * EXCLUDE (date) \
+               SELECT {cols} \
                FROM read_parquet('{glob}', hive_partitioning=true);\n\
              CREATE VIEW {name} AS \
                SELECT * FROM {live} UNION ALL SELECT * FROM {name}_hist;",
@@ -318,6 +322,22 @@ fn build_union_view(name: &str, hdb_dir: Option<&Path>) -> String {
         )
     } else {
         format!("CREATE VIEW {name} AS SELECT * FROM {live};")
+    }
+}
+
+/// Explicit column list for `<name>_hist`, matching the live table schema.
+///
+/// `symbol` is resolved from the Hive `symbol=…` partition directory;
+/// `date` (also Hive) is intentionally omitted.  All other columns come
+/// from the Parquet file itself.
+fn hist_columns(name: &str) -> &'static str {
+    match name {
+        "trades" =>
+            "symbol, symbol_id, seq, ts_exchange_ns, ts_local_ns, price, qty, side",
+        "quotes" =>
+            "symbol, symbol_id, seq, ts_exchange_ns, ts_local_ns, \
+             bid_price, bid_qty, ask_price, ask_qty",
+        _ => "*",
     }
 }
 
@@ -479,60 +499,116 @@ fn run_rollup_thread(stores: Arc<StoreSet>, hdb_dir: Arc<PathBuf>, interval_secs
             Err(e) => { error!(error = %e, "rollup: snapshot failed"); continue; }
         };
 
+        // Collect (tmp_path, final_path) pairs across both tables.
+        let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut all_ok = true;
 
         for (table, rb) in [("trades", &batch.trades), ("quotes", &batch.quotes)] {
             if rb.num_rows() == 0 {
                 continue;
             }
-            let out = hdb_dir
-                .join(table)
-                .join(format!("date={date}"))
-                .join(format!("{ts_secs}.parquet"));
-            // Write to a .tmp file first, then atomically rename.
-            let tmp = out.with_extension("parquet.tmp");
-            match rollup_write_parquet(&conn, rb.clone(), &tmp) {
-                Ok(()) => match std::fs::rename(&tmp, &out) {
-                    Ok(()) => info!(path = %out.display(), rows = rb.num_rows(), "rollup: chunk written"),
-                    Err(e) => {
-                        error!(error = %e, path = %out.display(), "rollup: rename failed");
-                        let _ = std::fs::remove_file(&tmp);
-                        all_ok = false;
-                    }
-                },
+            match rollup_write_symbol_chunks(&conn, rb.clone(), &hdb_dir, table, &date, ts_secs) {
+                Ok(mut pairs) => pending.append(&mut pairs),
                 Err(e) => {
-                    error!(error = %e, path = %tmp.display(), "rollup: write failed");
-                    let _ = std::fs::remove_file(&tmp);
+                    error!(error = %e, table, "rollup: write failed");
                     all_ok = false;
                 }
             }
         }
 
-        // Only trim the snapshotted rows from memory after both files are safe.
+        // Only rename once every per-symbol tmp file has been written.
         if all_ok {
-            stores.commit_rollup(&batch);
-        } else {
+            for (tmp, out) in &pending {
+                match std::fs::rename(tmp, out) {
+                    Ok(()) => info!(path = %out.display(), "rollup: chunk written"),
+                    Err(e) => {
+                        error!(error = %e, path = %out.display(), "rollup: rename failed");
+                        all_ok = false;
+                    }
+                }
+            }
+        }
+
+        // On any failure clean up all tmp files (remove_file is idempotent
+        // for files that were already renamed successfully).
+        if !all_ok {
+            for (tmp, _) in &pending {
+                let _ = std::fs::remove_file(tmp);
+            }
             warn!("rollup: skipping commit — rows retained for next cycle");
+        } else {
+            stores.commit_rollup(&batch);
         }
     }
 }
 
-/// Write a `RecordBatch` to a Parquet file using the rollup thread's
-/// persistent DuckDB connection.
-fn rollup_write_parquet(conn: &Connection, rb: RecordBatch, out: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(out.parent().context("invalid path")?)
-        .with_context(|| format!("creating dir for {}", out.display()))?;
-
+/// Load `rb` into a temporary DuckDB table, then write one `.parquet.tmp`
+/// file per distinct symbol under
+/// `<hdb_dir>/<table>/date=<date>/symbol=<sym>/<ts_secs>.parquet.tmp`.
+///
+/// Returns `(tmp_path, final_path)` pairs for the caller to rename atomically.
+/// On error, any `.tmp` files already written by this call are removed before
+/// returning so the caller's cleanup loop stays simple.
+fn rollup_write_symbol_chunks(
+    conn: &Connection,
+    rb: RecordBatch,
+    hdb_dir: &Path,
+    table: &str,
+    date: &str,
+    ts_secs: u64,
+) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
     conn.execute_batch("DROP TABLE IF EXISTS _rollup")?;
     let params = arrow_recordbatch_to_query_params(rb);
     conn.prepare("CREATE TEMP TABLE _rollup AS SELECT * FROM arrow(?, ?)")?
         .execute(params)?;
-    conn.execute_batch(&format!(
-        "COPY (SELECT * FROM _rollup) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-        out.display()
-    ))?;
-    conn.execute_batch("DROP TABLE IF EXISTS _rollup")?;
-    Ok(())
+
+    let mut sym_stmt = conn.prepare("SELECT DISTINCT symbol FROM _rollup ORDER BY symbol")?;
+    let symbols: Vec<String> = sym_stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    let mut written: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(symbols.len());
+
+    let result = (|| -> anyhow::Result<()> {
+        for sym in &symbols {
+            let sym_dir = hdb_dir
+                .join(table)
+                .join(format!("date={date}"))
+                .join(format!("symbol={sym}"));
+            std::fs::create_dir_all(&sym_dir)
+                .with_context(|| format!("creating {}", sym_dir.display()))?;
+            let tmp = sym_dir.join(format!("{ts_secs}.parquet.tmp"));
+            let out = sym_dir.join(format!("{ts_secs}.parquet"));
+
+            // Exclude `symbol` from the file; it is encoded in the path.
+            conn.execute_batch(&format!(
+                "COPY (SELECT * EXCLUDE (symbol) FROM _rollup WHERE symbol = {}) \
+                 TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                sql_quote(sym),
+                tmp.display()
+            ))
+            .with_context(|| format!("writing {}", tmp.display()))?;
+            written.push((tmp, out));
+        }
+        Ok(())
+    })();
+
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS _rollup");
+
+    match result {
+        Ok(()) => Ok(written),
+        Err(e) => {
+            for (tmp, _) in &written {
+                let _ = std::fs::remove_file(tmp);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Wrap `s` in single quotes, escaping any embedded single quotes.
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 fn unix_secs_now() -> u64 {
