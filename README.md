@@ -68,8 +68,9 @@ The rdb exposes three table tiers for each dataset:
 
 ```text
 trades_live   today's in-memory rows (always present)
-trades_hist   read_parquet('<hdb-dir>/trades/*.parquet')  (when --hdb is set
-              and at least one file exists)
+trades_hist   read_parquet('<hdb-dir>/trades/**/*.parquet',
+              hive_partitioning=true) — synthetic date column excluded
+              (present when --hdb is set and at least one file exists)
 trades        UNION ALL of trades_live + trades_hist
               (plain alias for trades_live when --hdb is not set)
 
@@ -104,18 +105,20 @@ live tables to Parquet:
 ./target/release/hdb-rollup --hdb-dir ./hdb --date 2024-01-15
 ```
 
-This writes:
+This writes Hive-partitioned files:
 
 ```
 hdb/
-  trades/2024-01-15.parquet
-  trades/2024-01-16.parquet
-  quotes/2024-01-15.parquet
-  quotes/2024-01-16.parquet
+  trades/date=2024-01-15/data.parquet
+  trades/date=2024-01-16/data.parquet
+  quotes/date=2024-01-15/data.parquet
+  quotes/date=2024-01-16/data.parquet
   …
 ```
 
-Each file is ZSTD-compressed and has the same schema as the live tables.
+Each file is ZSTD-compressed. The `date=…` directory names are Hive partition
+keys; DuckDB uses them to skip whole directories when a query carries a date
+predicate.
 
 To make the rdb serve both live and historical data, pass `--hdb`:
 
@@ -233,23 +236,29 @@ a query carries a date predicate. The synthetic `date` column is stripped
 via `SELECT * EXCLUDE (date)` so `trades_hist` stays schema-identical to
 `trades_live` and the `UNION ALL` in `trades` works without casting.
 
+**Row-cap eviction as only flush path → intra-day rollup.**
+`--rollup-interval-secs N` (requires `--hdb`) spawns a background thread
+that every N seconds snapshots and clears the in-memory stores, writing
+each non-empty batch to `<hdb>/<table>/date=YYYY-MM-DD/<unix_ts>.parquet`
+using the same Hive layout. With a 5-minute interval the stores never
+grow beyond one interval's worth of rows; `--row-cap` becomes a last-resort
+safety net rather than the primary eviction mechanism.
+
 ### Remaining scaling path
 
 1. Replace iceoryx2 with a network transport (Aeron or Chronicle) to
    allow multi-host fan-out and symbol sharding.
 2. Add symbol-level Hive partitioning to the HDB
    (`date=…/symbol=…/data.parquet`) for file-skip on both axes.
-3. Add an intra-day spill path so the rdb can partially flush to Parquet
-   without restarting (needed once row-cap eviction is unacceptable).
 
 ## Running it
 
 ```bash
 cargo build --release
 
-# Terminal 1 — start the rdb (with optional HDB, 4-worker pool, 500k row cap).
+# Terminal 1 — start the rdb (HDB, 4-worker pool, 500k row cap, 5-min intra-day rollup).
 ./target/release/rdb --symbols config/symbols.toml --hdb ./hdb \
-    --query-workers 4 --row-cap 500000
+    --query-workers 4 --row-cap 500000 --rollup-interval-secs 300
 
 # Terminal 2 — start the tickerplant.
 ./target/release/tickerplant --symbols config/symbols.toml \
