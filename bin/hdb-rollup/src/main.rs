@@ -6,13 +6,15 @@
 //!
 //! ```text
 //! <hdb-dir>/
-//!   trades/<YYYY-MM-DD>.parquet
-//!   quotes/<YYYY-MM-DD>.parquet
+//!   trades/date=YYYY-MM-DD/data.parquet
+//!   quotes/date=YYYY-MM-DD/data.parquet
 //! ```
 //!
-//! The schema of each Parquet file is identical to the corresponding live
-//! table, so the `rdb` binary can union them without any schema gymnastics
-//! when `--hdb <dir>` is supplied.
+//! The Hive-partitioned layout lets DuckDB skip whole date directories when
+//! a query carries a date predicate. The `rdb` binary mounts history with
+//! `read_parquet('…/**/*.parquet', hive_partitioning=true)` and strips the
+//! synthetic `date` column so `trades_hist` stays schema-identical to
+//! `trades_live`.
 //!
 //! Typical usage (run at midnight or end of trading session):
 //!
