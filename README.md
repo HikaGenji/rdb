@@ -34,6 +34,11 @@ and known bottlenecks.
 
 ## Layout
 
+The whole stack ships as a **single `rdb` binary** with one subcommand per
+role. Sharing one binary lets the linker deduplicate every heavy
+dependency (DuckDB, Arrow, tokio, zenoh, …) so the on-disk image is
+markedly smaller than the sum of seven separate executables.
+
 ```
 crates/
   tp-types       Schemas (Trade, QuoteL1), iceoryx2 service tuning,
@@ -42,24 +47,28 @@ crates/
   tp-wal         Append-only mmap-backed WAL writer/reader.
   tp-arrow       Per-symbol record stores and Arrow snapshot/IPC helpers.
 
-bin/
-  feed-replayer  Reads JSONL feed events, publishes to `rdb/trades/raw`
-                 and `rdb/quotes/raw`. Firehose or wall-clock pacing.
-  tickerplant    Subscribes to `*/raw`, assigns sequence numbers, persists
-                 to mmap'd WAL, republishes on `*/agg`.
-  rdb            Subscribes to `*/agg`, appends to per-symbol Arrow
-                 buffers, serves SQL on a Unix domain socket.
-  hdb-rollup     Snapshots the live tables to dated Parquet files at
-                 end of day. Run once per session (e.g. via cron).
-  query-cli      Sends one SQL query over the Unix socket, prints the
-                 result as a pretty Arrow table.
-  pg-gateway     PostgreSQL wire-protocol proxy for the Unix socket so
-                 standard SQL clients (DBeaver, DataGrip, psql, …) can
-                 connect without any plugin.
-  zenoh-bridge   Cross-host relay. Outbound mode subscribes to `*/agg`
-                 on iceoryx2 and republishes over zenoh; inbound mode
-                 does the reverse. Existing binaries are unchanged.
+bin/rdb/         Single binary. Subcommands:
+  rdb serve         Subscribe to */agg, append to per-symbol Arrow buffers,
+                    serve SQL on a Unix domain socket.
+  rdb tickerplant   Subscribe to */raw, assign sequence numbers, persist
+                    to mmap'd WAL, republish on */agg.
+  rdb feed-replayer Read JSONL feed events, publish to rdb/trades/raw and
+                    rdb/quotes/raw. Firehose or wall-clock pacing.
+  rdb hdb-rollup    Snapshot the live tables to dated Parquet files at
+                    end of day. Run once per session (e.g. via cron).
+  rdb query         Send one SQL query over the Unix socket, print the
+                    result as a pretty Arrow table.
+  rdb pg-gateway    PostgreSQL wire-protocol proxy for the Unix socket so
+                    standard SQL clients (DBeaver, DataGrip, psql, …) can
+                    connect without any plugin.
+  rdb zenoh-bridge  Cross-host relay. Outbound mode subscribes to */agg
+                    on iceoryx2 and republishes over zenoh; inbound mode
+                    does the reverse.
 ```
+
+Run `rdb --help` for the subcommand list, `rdb <subcommand> --help` for
+flags. The release profile is tuned for size: fat LTO, single codegen
+unit, `panic=abort`, stripped symbols.
 
 ## Wire schemas
 
@@ -107,15 +116,15 @@ Parquet predicate-pushdown when filtering on timestamp columns.
 
 ## Historical database (HDB)
 
-At the end of each trading session, run `hdb-rollup` to snapshot the
+At the end of each trading session, run `rdb hdb-rollup` to snapshot the
 live tables to Parquet:
 
 ```bash
 # Roll up today (UTC date inferred automatically).
-./target/release/hdb-rollup --hdb-dir ./hdb
+./target/release/rdb hdb-rollup --hdb-dir ./hdb
 
 # Or supply an explicit date for backfills.
-./target/release/hdb-rollup --hdb-dir ./hdb --date 2024-01-15
+./target/release/rdb hdb-rollup --hdb-dir ./hdb --date 2024-01-15
 ```
 
 This writes two-level Hive-partitioned files:
@@ -138,7 +147,7 @@ a column-name conflict with the Hive partition key.
 To make the rdb serve both live and historical data, pass `--hdb`:
 
 ```bash
-./target/release/rdb --symbols config/symbols.toml --hdb ./hdb
+./target/release/rdb serve --symbols config/symbols.toml --hdb ./hdb
 ```
 
 Clients that only ever queried `trades` or `quotes` see no change — they
@@ -161,7 +170,7 @@ ORDER  BY symbol, day;
 A typical cron entry for midnight UTC rollup:
 
 ```cron
-0 0 * * * /path/to/hdb-rollup --hdb-dir /data/hdb >> /var/log/hdb-rollup.log 2>&1
+0 0 * * * /path/to/rdb hdb-rollup --hdb-dir /data/hdb >> /var/log/hdb-rollup.log 2>&1
 ```
 
 ## PostgreSQL gateway
@@ -170,10 +179,10 @@ Any client that speaks the Postgres protocol can connect directly:
 
 ```bash
 # Start the gateway (defaults: 0.0.0.0:5432, /tmp/rdb.sock).
-./target/release/rdb-pg-gateway
+./target/release/rdb pg-gateway
 
 # Or with custom endpoints.
-./target/release/rdb-pg-gateway --listen 127.0.0.1:5433 --socket /tmp/rdb.sock
+./target/release/rdb pg-gateway --listen 127.0.0.1:5433 --socket /tmp/rdb.sock
 ```
 
 Then connect from any SQL tool — no plugin required:
@@ -271,33 +280,34 @@ existing binary. Same-host paths stay on iceoryx2 shared memory. See
 ## Running it
 
 ```bash
-cargo build --release
+cargo build --release      # produces a single ./target/release/rdb
 
-# Terminal 1 — start the rdb (HDB, 4-worker pool, 500k row cap, 5-min intra-day rollup).
-./target/release/rdb --symbols config/symbols.toml --hdb ./hdb \
+# Terminal 1 — start the in-memory server (HDB, 4-worker pool, 500k row cap,
+# 5-min intra-day rollup).
+./target/release/rdb serve --symbols config/symbols.toml --hdb ./hdb \
     --query-workers 4 --row-cap 500000 --rollup-interval-secs 300
 
 # Terminal 2 — start the tickerplant.
-./target/release/tickerplant --symbols config/symbols.toml \
+./target/release/rdb tickerplant --symbols config/symbols.toml \
     --wal-dir /tmp/rdb-wal
 
 # Terminal 3 — replay the sample feed.
-./target/release/feed-replayer --symbols config/symbols.toml \
+./target/release/rdb feed-replayer --symbols config/symbols.toml \
     --input samples/sample.jsonl
 
 # Terminal 4 — query via CLI.
-./target/release/rdb-query --sql "
+./target/release/rdb query --sql "
     SELECT symbol, COUNT(*) AS n, AVG(price) AS avg_px
     FROM trades
     GROUP BY symbol
     ORDER BY symbol"
 
 # Terminal 4 (alternative) — start the Postgres gateway and use psql.
-./target/release/rdb-pg-gateway
+./target/release/rdb pg-gateway
 psql -h localhost -p 5432 -d rdb -c "SELECT symbol, COUNT(*) FROM trades GROUP BY 1"
 
 # At end of day — snapshot live tables to Parquet.
-./target/release/hdb-rollup --hdb-dir ./hdb
+./target/release/rdb hdb-rollup --hdb-dir ./hdb
 ```
 
 ## Multi-host deployment (zenoh-bridge)
@@ -306,17 +316,17 @@ On the **tickerplant host**, start the outbound bridge after the tickerplant:
 
 ```bash
 # LAN — zenoh uses multicast scouting; no config needed.
-./target/release/zenoh-bridge --mode outbound
+./target/release/rdb zenoh-bridge --mode outbound
 
 # WAN / router-based — supply a zenoh config pointing at a router.
-./target/release/zenoh-bridge --mode outbound --zenoh-config zenoh-router.json5
+./target/release/rdb zenoh-bridge --mode outbound --zenoh-config zenoh-router.json5
 ```
 
-On each **remote rdb host**, start the inbound bridge before the rdb:
+On each **remote rdb host**, start the inbound bridge before the server:
 
 ```bash
-./target/release/zenoh-bridge --mode inbound
-./target/release/rdb --symbols config/symbols.toml
+./target/release/rdb zenoh-bridge --mode inbound
+./target/release/rdb serve --symbols config/symbols.toml
 ```
 
 The inbound bridge injects arriving `agg` messages into the local iceoryx2
@@ -331,8 +341,9 @@ For zenoh router configuration and cross-subnet deployments, see the
 
 ```bash
 cargo test --workspace --lib            # unit tests
-cargo test -p rdb --test end_to_end     # spawns the four binaries and
-                                        # verifies count + asof join
+cargo test -p rdb --test end_to_end     # drives `rdb serve`,
+                                        # `rdb tickerplant`, and
+                                        # `rdb feed-replayer` end-to-end.
 ```
 
 The integration test cleans `/tmp/iceoryx2/` before it runs because

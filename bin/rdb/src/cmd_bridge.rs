@@ -1,17 +1,4 @@
-//! Cross-host fan-out bridge: iceoryx2 ↔ zenoh.
-//!
-//! Same-host paths continue using iceoryx2 shared memory unchanged.
-//! This binary sits at the host boundary and forwards the `*/agg` topics
-//! (produced by the tickerplant, consumed by rdb) over a zenoh session so
-//! remote rdb instances can participate.
-//!
-//! ```text
-//! # On the tickerplant host:
-//! zenoh-bridge --mode outbound
-//!
-//! # On each remote rdb host:
-//! zenoh-bridge --mode inbound
-//! ```
+//! `rdb zenoh-bridge` — cross-host iceoryx2 ↔ zenoh relay.
 
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -19,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytemuck::{bytes_of, pod_read_unaligned};
-use clap::{Parser, ValueEnum};
+use clap::ValueEnum;
 use iceoryx2::prelude::*;
 use tracing::{info, warn};
 use zenoh::sample::Sample;
@@ -27,25 +14,20 @@ use zenoh::sample::Sample;
 use tp_types::{ipc_cfg, topics, QuoteL1, Trade};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum Mode {
-    /// Subscribe to rdb/trades/agg and rdb/quotes/agg on iceoryx2,
-    /// republish over zenoh. Run on the tickerplant host.
+pub enum Mode {
+    /// Subscribe to */agg on iceoryx2, republish over zenoh. Tickerplant host.
     Outbound,
-    /// Subscribe to rdb/trades/agg and rdb/quotes/agg on zenoh,
-    /// inject into iceoryx2. Run on each remote rdb host.
+    /// Subscribe to */agg on zenoh, inject into iceoryx2. Remote rdb host.
     Inbound,
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "zenoh-bridge", about = "Cross-host iceoryx2 ↔ zenoh relay")]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// Bridge direction.
     #[arg(long)]
     mode: Mode,
 
     /// Zenoh configuration file (JSON5/YAML).
-    /// Without this, zenoh uses multicast scouting — works on a LAN.
-    /// Supply a router config for WAN or firewalled deployments.
     #[arg(long)]
     zenoh_config: Option<PathBuf>,
 
@@ -58,9 +40,7 @@ fn ze<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-fn main() -> anyhow::Result<()> {
-    init_tracing();
-    let args = Args::parse();
+pub fn run(args: Args) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -70,10 +50,6 @@ fn main() -> anyhow::Result<()> {
         Mode::Inbound => run_inbound(args, &rt),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Outbound: iceoryx2 → zenoh
-// ---------------------------------------------------------------------------
 
 fn run_outbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     let node = NodeBuilder::new().create::<ipc::Service>()?;
@@ -136,10 +112,6 @@ fn run_outbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Inbound: zenoh → iceoryx2
-// ---------------------------------------------------------------------------
-
 fn run_inbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     let node = NodeBuilder::new().create::<ipc::Service>()?;
 
@@ -168,9 +140,6 @@ fn run_inbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         .block_on(async { zenoh::open(zconfig).await })
         .map_err(|e| anyhow::anyhow!("opening zenoh session: {e}"))?;
 
-    // Declare zenoh subscribers with callbacks that push raw bytes onto
-    // bounded crossbeam channels. The callbacks fire on zenoh's internal
-    // threads; the main loop drains the channels and publishes to iceoryx2.
     let (trade_bytes_tx, trade_bytes_rx) =
         crossbeam_channel::bounded::<Vec<u8>>(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE);
     let (quote_bytes_tx, quote_bytes_rx) =
@@ -235,12 +204,7 @@ fn run_inbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
             std::thread::sleep(idle);
         }
     }
-    // _trade_zen_sub and _quote_zen_sub keep subscriptions alive until here.
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn build_zenoh_config(path: &Option<PathBuf>) -> anyhow::Result<zenoh::Config> {
     match path {
@@ -248,16 +212,4 @@ fn build_zenoh_config(path: &Option<PathBuf>) -> anyhow::Result<zenoh::Config> {
             .map_err(|e| anyhow::anyhow!("loading zenoh config {}: {e}", p.display())),
         None => Ok(zenoh::Config::default()),
     }
-}
-
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt()
-        .json()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
 }

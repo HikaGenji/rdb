@@ -5,13 +5,7 @@ members = [
     "crates/tp-config",
     "crates/tp-arrow",
     "crates/tp-wal",
-    "bin/feed-replayer",
-    "bin/tickerplant",
     "bin/rdb",
-    "bin/query-cli",
-    "bin/pg-gateway",
-    "bin/hdb-rollup",
-    "bin/zenoh-bridge",
 ]
 
 [workspace.package]
@@ -27,7 +21,7 @@ tp-wal     = { path = "crates/tp-wal" }
 
 iceoryx2 = "0.7"
 zenoh = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 duckdb   = "1"
 arrow    = "58"
 arrow-array  = "58"
@@ -49,8 +43,15 @@ parking_lot = "0.12"
 anyhow      = "1"
 thiserror   = "1"
 
+# Single-binary release profile: heavy LTO, one codegen unit, abort on panic,
+# and full symbol stripping. The whole stack ships as one `rdb` executable
+# so duplicate dependency images (DuckDB, Arrow, tokio, zenoh, …) collapse
+# into a single copy at link time.
 [profile.release]
 opt-level     = 3
-lto           = "thin"
+lto           = "fat"
 codegen-units = 1
-debug         = 1
+panic         = "abort"
+strip         = "symbols"
+debug         = false
+incremental   = false

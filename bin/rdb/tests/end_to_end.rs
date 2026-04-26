@@ -1,7 +1,8 @@
 //! End-to-end integration test.
 //!
-//! Spawns the four binaries (`feed-replayer`, `tickerplant`, `rdb`,
-//! `rdb-query`), drives a sample JSONL through them, and verifies:
+//! Drives the consolidated `rdb` binary through three of its subcommands
+//! (`rdb serve`, `rdb tickerplant`, `rdb feed-replayer`) over a sample
+//! JSONL feed and verifies:
 //!
 //! 1. The rdb's `trades` table has the expected row count.
 //! 2. An asof-join between trades and quotes produces a row count matching
@@ -37,14 +38,17 @@ fn rdb_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rdb"))
 }
 
-fn sibling_binary(name: &str) -> PathBuf {
-    rdb_binary().parent().unwrap().join(name)
+/// Spawn the rdb binary with the given subcommand.
+fn rdb_cmd(subcommand: &str) -> Command {
+    let mut c = Command::new(rdb_binary());
+    c.arg(subcommand);
+    c
 }
 
-/// Build all workspace binaries so the sibling executables exist.
+/// Build the rdb binary so the integration test has something to spawn.
 fn ensure_binaries_built() {
     let status = Command::new(env!("CARGO"))
-        .args(["build", "--workspace", "--bins", "--quiet"])
+        .args(["build", "--bin", "rdb", "--quiet"])
         .current_dir(workspace_root())
         .status()
         .expect("cargo build");
@@ -157,13 +161,12 @@ fn end_to_end_replay_and_asof() {
     let _ = std::fs::remove_dir_all("/tmp/iceoryx2");
 
     // Start the rdb first so it is ready to receive aggregated records.
-    let rdb_path = rdb_binary();
-    let mut rdb = Command::new(&rdb_path);
+    let mut rdb = rdb_cmd("serve");
     rdb.arg("--symbols").arg(&symbols)
        .arg("--socket").arg(&socket)
        .arg("--idle-exit-secs").arg("3")
        .env("RUST_LOG", "warn");
-    let mut rdb = ChildGuard::new(rdb.spawn().expect("spawn rdb"));
+    let mut rdb = ChildGuard::new(rdb.spawn().expect("spawn rdb serve"));
 
     assert!(
         wait_for_socket(&socket, Duration::from_secs(5)),
@@ -172,13 +175,12 @@ fn end_to_end_replay_and_asof() {
     );
 
     // Tickerplant.
-    let tp_path = sibling_binary("tickerplant");
-    let mut tp = Command::new(&tp_path);
+    let mut tp = rdb_cmd("tickerplant");
     tp.arg("--symbols").arg(&symbols)
       .arg("--wal-dir").arg(&wal_dir)
       .arg("--idle-exit-secs").arg("2")
       .env("RUST_LOG", "warn");
-    let tp = ChildGuard::new(tp.spawn().expect("spawn tickerplant"));
+    let tp = ChildGuard::new(tp.spawn().expect("spawn rdb tickerplant"));
 
     // Give the tickerplant a moment to attach its subscribers before the
     // replayer starts publishing — iceoryx2 subscribers only see samples
@@ -186,13 +188,12 @@ fn end_to_end_replay_and_asof() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Feed replayer (firehose mode, full sample file).
-    let fr_path = sibling_binary("feed-replayer");
-    let mut fr = Command::new(&fr_path);
+    let mut fr = rdb_cmd("feed-replayer");
     fr.arg("--symbols").arg(&symbols)
       .arg("--input").arg(&sample)
       .arg("--pace").arg("firehose")
       .env("RUST_LOG", "warn");
-    let fr = ChildGuard::new(fr.spawn().expect("spawn feed-replayer"));
+    let fr = ChildGuard::new(fr.spawn().expect("spawn rdb feed-replayer"));
 
     // Wait for replayer to finish, then for tickerplant to drain and exit.
     let fr_status = fr.wait().expect("wait fr");
