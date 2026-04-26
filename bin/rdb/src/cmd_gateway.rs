@@ -1,8 +1,4 @@
-//! PostgreSQL wire-protocol gateway for the rdb Unix socket.
-//!
-//! Any client that speaks the Postgres protocol (DBeaver, DataGrip, psql,
-//! Metabase, SQLPad, …) can connect and run SQL queries that are forwarded
-//! to the rdb process via its Unix socket.
+//! `rdb pg-gateway` — PostgreSQL wire-protocol gateway for the rdb Unix socket.
 
 use std::fmt::Debug;
 use std::os::unix::net::UnixStream;
@@ -14,7 +10,6 @@ use arrow_array::{Array, BooleanArray, Float32Array, Float64Array, Int32Array, I
                   StringArray, UInt32Array, UInt64Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use clap::Parser;
 use futures::{stream, Sink};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
@@ -29,9 +24,8 @@ use tokio::net::TcpListener;
 use tp_arrow::decode_ipc_stream;
 use tp_types::query_proto;
 
-#[derive(Parser)]
-#[command(name = "rdb-pg-gateway", about = "PostgreSQL wire-protocol gateway to the rdb Unix socket")]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// rdb Unix socket path.
     #[arg(long, default_value = "/tmp/rdb.sock")]
     socket: PathBuf,
@@ -41,9 +35,32 @@ struct Args {
     listen: String,
 }
 
-// ---------------------------------------------------------------------------
-// Handler
-// ---------------------------------------------------------------------------
+pub fn run(args: Args) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    rt.block_on(serve(args))
+}
+
+async fn serve(args: Args) -> anyhow::Result<()> {
+    let factory = Arc::new(GatewayFactory {
+        handler: Arc::new(RdbHandler::new(args.socket.clone())),
+    });
+
+    let listener = TcpListener::bind(&args.listen).await?;
+    eprintln!("rdb-pg-gateway: {} → {}", args.listen, args.socket.display());
+
+    loop {
+        let (socket, addr) = listener.accept().await?;
+        let factory = factory.clone();
+        tokio::spawn(async move {
+            if let Err(e) = process_socket(socket, None, factory).await {
+                eprintln!("connection {addr}: {e}");
+            }
+        });
+    }
+}
 
 struct RdbHandler {
     socket_path: PathBuf,
@@ -55,8 +72,6 @@ impl RdbHandler {
     }
 }
 
-// NoopStartupHandler is a trait — implementing it (with no body) accepts any
-// client without authentication.
 impl NoopStartupHandler for RdbHandler {}
 
 fn arrow_to_pg(dt: &DataType) -> Type {
@@ -64,7 +79,6 @@ fn arrow_to_pg(dt: &DataType) -> Type {
         DataType::Boolean => Type::BOOL,
         DataType::Int8 | DataType::Int16 => Type::INT2,
         DataType::Int32 => Type::INT4,
-        // UInt32/UInt64 have no unsigned Postgres equivalent; promote to INT8.
         DataType::Int64
         | DataType::UInt8
         | DataType::UInt16
@@ -124,14 +138,12 @@ impl SimpleQueryHandler for RdbHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // Strip trailing semicolons / whitespace that some clients append.
         let sql = query.trim().trim_end_matches(';').trim();
 
         if sql.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
         }
 
-        // Intercept PostgreSQL session-management commands that DuckDB ignores.
         let verb = sql.split_ascii_whitespace().next().unwrap_or("").to_ascii_uppercase();
         match verb.as_str() {
             "SET" | "RESET" | "BEGIN" | "COMMIT" | "ROLLBACK" | "DEALLOCATE" => {
@@ -204,10 +216,6 @@ impl SimpleQueryHandler for RdbHandler {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Handler factory
-// ---------------------------------------------------------------------------
-
 struct GatewayFactory {
     handler: Arc<RdbHandler>,
 }
@@ -232,31 +240,5 @@ impl PgWireHandlerFactory for GatewayFactory {
 
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {
         Arc::new(NoopCopyHandler)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    let factory = Arc::new(GatewayFactory {
-        handler: Arc::new(RdbHandler::new(args.socket.clone())),
-    });
-
-    let listener = TcpListener::bind(&args.listen).await?;
-    eprintln!("rdb-pg-gateway: {} → {}", args.listen, args.socket.display());
-
-    loop {
-        let (socket, addr) = listener.accept().await?;
-        let factory = factory.clone();
-        tokio::spawn(async move {
-            if let Err(e) = process_socket(socket, None, factory).await {
-                eprintln!("connection {addr}: {e}");
-            }
-        });
     }
 }

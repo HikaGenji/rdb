@@ -1,10 +1,8 @@
-//! Simulated feed handler.
+//! `rdb feed-replayer` — JSONL → iceoryx2 publisher.
 //!
 //! Reads a JSONL file (one [`tp_types::FeedEvent`] per line), encodes each
 //! event into a fixed binary [`tp_types::Trade`] / [`tp_types::QuoteL1`],
-//! and publishes to two iceoryx2 services. The `--pace` flag chooses
-//! between firehose mode (publish as fast as possible) and wall-clock
-//! pacing using the `ts_exchange_ns` deltas in the file.
+//! and publishes to two iceoryx2 services.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -12,24 +10,23 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::{Parser, ValueEnum};
+use clap::ValueEnum;
 use iceoryx2::prelude::*;
 use tracing::{info, warn};
 
 use tp_config::SymbolTable;
-use tp_types::{ipc_cfg, topics, wall_ns, FeedEvent, QuoteL1, Side, Trade};
+use tp_types::{ipc_cfg, topics, wall_ns, FeedEvent, QuoteL1, Trade};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum Pace {
+pub enum Pace {
     /// Publish every event as fast as possible.
     Firehose,
     /// Sleep between events to match the inter-event delays in the file.
     WallClock,
 }
 
-#[derive(Parser, Debug)]
-#[command(name = "feed-replayer")]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// Path to the symbols TOML file.
     #[arg(long)]
     symbols: PathBuf,
@@ -47,9 +44,7 @@ struct Args {
     limit: u64,
 }
 
-fn main() -> anyhow::Result<()> {
-    init_tracing();
-    let args = Args::parse();
+pub fn run(args: Args) -> anyhow::Result<()> {
     let symbols = SymbolTable::from_path(&args.symbols)
         .with_context(|| format!("loading symbols {}", args.symbols.display()))?;
     info!(symbol_count = symbols.len(), "loaded symbols");
@@ -157,19 +152,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!(sent, skipped, "feed-replayer finished");
-    // Hold the publishers around briefly so a slow subscriber can drain.
     std::thread::sleep(Duration::from_millis(50));
-    let _ = Side::Buy; // suppress unused-import warning if Side becomes inlined
     Ok(())
-}
-
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt()
-        .json()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
 }

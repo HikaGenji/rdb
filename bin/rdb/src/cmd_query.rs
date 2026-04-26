@@ -1,5 +1,4 @@
-//! Tiny SQL client for the rdb Unix socket. Sends one query, prints the
-//! result as a pretty Arrow table to stdout.
+//! `rdb query` — send one SQL query and pretty-print the result.
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
@@ -7,14 +6,12 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use arrow::util::pretty::pretty_format_batches;
-use clap::Parser;
 
 use tp_arrow::decode_ipc_stream;
 use tp_types::query_proto;
 
-#[derive(Parser, Debug)]
-#[command(name = "rdb-query")]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// Unix socket path of the rdb.
     #[arg(long, default_value = "/tmp/rdb.sock")]
     socket: PathBuf,
@@ -28,8 +25,7 @@ struct Args {
     from_stdin: bool,
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+pub fn run(args: Args) -> anyhow::Result<()> {
     let sql = match (args.sql, args.from_stdin) {
         (Some(s), false) => s,
         (None, true) => {

@@ -1,19 +1,13 @@
-//! Tickerplant.
+//! `rdb tickerplant` — sequence-numbering relay with WAL.
 //!
-//! Subscribes to the raw `*/raw` topics, assigns monotonically increasing
-//! per-stream sequence numbers, persists each record to an mmap-backed WAL
-//! (one per stream), and republishes onto `*/agg`. Both incoming streams
-//! are polled from a single thread.
-//!
-//! For prototype simplicity there is no signal handler. Pass
-//! `--idle-exit-secs N` to make the process exit after N seconds without
-//! any incoming messages, or kill it with SIGKILL.
+//! Subscribes to `*/raw`, assigns monotonically increasing per-stream
+//! sequence numbers, persists each record to an mmap-backed WAL, and
+//! republishes onto `*/agg`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
 use iceoryx2::prelude::*;
 use tracing::info;
 
@@ -21,11 +15,9 @@ use tp_config::SymbolTable;
 use tp_types::{ipc_cfg, metrics::LatencyHistogram, topics, wall_ns, QuoteL1, Trade};
 use tp_wal::WalWriter;
 
-#[derive(Parser, Debug)]
-#[command(name = "tickerplant")]
-struct Args {
-    /// Path to symbols TOML file (loaded for validation only; the
-    /// tickerplant does not need to interpret prices).
+#[derive(clap::Args, Debug)]
+pub struct Args {
+    /// Path to symbols TOML file.
     #[arg(long)]
     symbols: PathBuf,
 
@@ -51,10 +43,7 @@ struct Args {
     hist_capacity: usize,
 }
 
-fn main() -> anyhow::Result<()> {
-    init_tracing();
-    let args = Args::parse();
-
+pub fn run(args: Args) -> anyhow::Result<()> {
     let symbols = SymbolTable::from_path(&args.symbols)
         .with_context(|| format!("loading symbols {}", args.symbols.display()))?;
     info!(symbol_count = symbols.len(), "loaded symbols");
@@ -192,15 +181,4 @@ fn main() -> anyhow::Result<()> {
     );
     drop(symbols);
     Ok(())
-}
-
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt()
-        .json()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
 }

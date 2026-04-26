@@ -1338,21 +1338,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
-name = "feed-replayer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "iceoryx2",
- "serde",
- "serde_json",
- "tp-config",
- "tp-types",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "filetime"
 version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1670,20 +1655,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "hdb-rollup"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "arrow-array",
- "arrow-schema",
- "clap",
- "duckdb",
- "tp-arrow",
- "tp-types",
 ]
 
 [[package]]
@@ -2944,22 +2915,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "clap",
- "futures",
- "pgwire",
- "tokio",
- "tp-arrow",
- "tp-types",
-]
-
-[[package]]
 name = "pgwire"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3219,22 +3174,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "query-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "clap",
- "tp-arrow",
- "tp-types",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3417,16 +3356,24 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "async-trait",
+ "bytemuck",
  "clap",
  "crossbeam-channel",
  "duckdb",
+ "futures",
  "iceoryx2",
  "parking_lot",
+ "pgwire",
+ "serde_json",
+ "tokio",
  "tp-arrow",
  "tp-config",
  "tp-types",
+ "tp-wal",
  "tracing",
  "tracing-subscriber",
+ "zenoh",
 ]
 
 [[package]]
@@ -4402,21 +4349,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tickerplant"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "iceoryx2",
- "parking_lot",
- "tp-config",
- "tp-types",
- "tp-wal",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5832,22 +5764,6 @@ dependencies = [
  "zenoh-task",
  "zenoh-transport",
  "zenoh-util",
-]
-
-[[package]]
-name = "zenoh-bridge"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "clap",
- "crossbeam-channel",
- "iceoryx2",
- "tokio",
- "tp-types",
- "tracing",
- "tracing-subscriber",
- "zenoh",
 ]
 
 [[package]]

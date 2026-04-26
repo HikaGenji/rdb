@@ -1,34 +1,4 @@
-//! HDB daily rollup.
-//!
-//! Connects to a running `rdb` process via its Unix socket, fetches the
-//! current in-memory `trades_live` and `quotes_live` tables as Arrow IPC,
-//! and writes them as Parquet files under the target HDB directory with
-//! two-level Hive partitioning:
-//!
-//! ```text
-//! <hdb-dir>/
-//!   trades/date=YYYY-MM-DD/symbol=BTC-PERP/data.parquet
-//!   trades/date=YYYY-MM-DD/symbol=ETH-PERP/data.parquet
-//!   quotes/date=YYYY-MM-DD/symbol=BTC-PERP/data.parquet
-//!   quotes/date=YYYY-MM-DD/symbol=ETH-PERP/data.parquet
-//!   …
-//! ```
-//!
-//! The two-level Hive layout lets DuckDB skip whole date directories on date
-//! predicates **and** skip individual symbol directories on symbol predicates.
-//! The `symbol` value is encoded purely in the directory name; it is omitted
-//! from the Parquet file itself to avoid a column-name conflict when DuckDB
-//! reads with `hive_partitioning=true`. The `rdb` binary mounts history with
-//! `read_parquet('…/**/*.parquet', hive_partitioning=true)` and selects
-//! columns by name so `trades_hist` stays schema-identical to `trades_live`.
-//!
-//! Typical usage (run at midnight or end of trading session):
-//!
-//! ```sh
-//! hdb-rollup --hdb-dir ./hdb
-//! # or for a specific date:
-//! hdb-rollup --hdb-dir ./hdb --date 2024-01-15
-//! ```
+//! `rdb hdb-rollup` — snapshot live tables to dated Parquet files.
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -36,16 +6,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
-use clap::Parser;
 use duckdb::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
 use duckdb::Connection;
 
 use tp_arrow::decode_ipc_stream;
 use tp_types::query_proto;
 
-#[derive(Parser)]
-#[command(name = "hdb-rollup", about = "Snapshot rdb live tables to daily Parquet files")]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct Args {
     /// rdb Unix socket path.
     #[arg(long, default_value = "/tmp/rdb.sock")]
     socket: PathBuf,
@@ -55,19 +23,13 @@ struct Args {
     #[arg(long, default_value = "./hdb")]
     hdb_dir: PathBuf,
 
-    /// Date label for the output files (YYYY-MM-DD). Defaults to today in
-    /// UTC. Supply an explicit value when rolling up a prior session.
+    /// Date label for the output files (YYYY-MM-DD). Defaults to today UTC.
     #[arg(long)]
     date: Option<String>,
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    let date = match args.date {
-        Some(d) => d,
-        None => today_utc(),
-    };
+pub fn run(args: Args) -> anyhow::Result<()> {
+    let date = args.date.unwrap_or_else(today_utc);
 
     eprintln!("hdb-rollup: rolling up date={date} from {}", args.socket.display());
 
@@ -90,10 +52,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// RDB query helper
-// ---------------------------------------------------------------------------
-
 fn fetch(socket: &Path, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
     let mut stream =
         UnixStream::connect(socket).with_context(|| format!("connecting to {}", socket.display()))?;
@@ -106,16 +64,6 @@ fn fetch(socket: &Path, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Parquet writer
-// ---------------------------------------------------------------------------
-
-/// Write `batches` to per-symbol Parquet files under
-/// `<dir>/date=<date>/symbol=<sym>/data.parquet`.
-///
-/// Each file omits the `symbol` column; it is encoded in the directory name
-/// so DuckDB can apply file-skip on both the `date` and `symbol` axes when
-/// reading with `hive_partitioning=true`.
 fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Result<()> {
     if batches.is_empty() || total_rows(batches) == 0 {
         eprintln!("  skipping empty table for {}", dir.display());
@@ -138,13 +86,11 @@ fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Res
         .collect::<Result<_, _>>()?;
 
     for sym in &symbols {
-        // Hive layout: date=YYYY-MM-DD/symbol=<sym>/data.parquet
         let sym_dir = dir.join(format!("date={date}")).join(format!("symbol={sym}"));
         std::fs::create_dir_all(&sym_dir)
             .with_context(|| format!("creating {}", sym_dir.display()))?;
         let out_path = sym_dir.join("data.parquet");
 
-        // Exclude `symbol` from the file; it is already encoded in the path.
         let copy_sql = format!(
             "COPY (SELECT * EXCLUDE (symbol) FROM _data WHERE symbol = {}) \
              TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
@@ -159,28 +105,20 @@ fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Res
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
 fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-/// Wrap `s` in single quotes, escaping any embedded single quotes.
 fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
 fn today_utc() -> String {
-    // Use std::time to get today's date without pulling in a chrono dependency.
-    // Seconds since Unix epoch → days → YYYY-MM-DD.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let days = secs / 86400;
-    // Tomohiko Sakamoto's algorithm for Gregorian calendar.
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
