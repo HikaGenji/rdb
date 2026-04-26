@@ -4,13 +4,23 @@ A kdb-style market data platform for crypto perpetuals, in Rust.
 The stack covers the full pipeline from raw feed to long-term queryable
 history, with a standard SQL interface usable from any BI tool:
 
+Single-host:
 ```
 feed-replayer ─► tickerplant ─► rdb (in-memory) ─►─┐
                      │                               │ pg-gateway (Postgres wire)
                      └─► WAL (mmap)           hdb-rollup ─► Parquet files
 ```
 
-Transport between processes is zero-copy shared memory ([iceoryx2]).
+Multi-host (via `zenoh-bridge`):
+```
+Host A  feed-replayer ─► tickerplant ─► rdb/*/agg ─► zenoh-bridge --mode outbound
+                                                              │
+                                                        zenoh (UDP/TCP)
+                                                              │
+Host B                          zenoh-bridge --mode inbound ─► rdb/*/agg ─► rdb
+```
+
+Same-host transport is zero-copy shared memory ([iceoryx2]).
 Queries are served by DuckDB, operating on Arrow columnar buffers for
 live data and on Parquet files for historical data. The two are
 transparently unioned so clients see a single `trades` / `quotes` table
@@ -46,6 +56,9 @@ bin/
   pg-gateway     PostgreSQL wire-protocol proxy for the Unix socket so
                  standard SQL clients (DBeaver, DataGrip, psql, …) can
                  connect without any plugin.
+  zenoh-bridge   Cross-host relay. Outbound mode subscribes to `*/agg`
+                 on iceoryx2 and republishes over zenoh; inbound mode
+                 does the reverse. Existing binaries are unchanged.
 ```
 
 ## Wire schemas
@@ -244,11 +257,15 @@ using the same Hive layout. With a 5-minute interval the stores never
 grow beyond one interval's worth of rows; `--row-cap` becomes a last-resort
 safety net rather than the primary eviction mechanism.
 
+**Single-host iceoryx2 → cross-host zenoh bridge.**
+`zenoh-bridge` forwards the tickerplant's `*/agg` output to remote rdb
+instances over zenoh (UDP/TCP multicast or router) without modifying any
+existing binary. Same-host paths stay on iceoryx2 shared memory. See
+[Multi-host deployment](#multi-host-deployment-zenoh-bridge) below.
+
 ### Remaining scaling path
 
-1. Replace iceoryx2 with a network transport (Aeron or Chronicle) to
-   allow multi-host fan-out and symbol sharding.
-2. Add symbol-level Hive partitioning to the HDB
+1. Add symbol-level Hive partitioning to the HDB
    (`date=…/symbol=…/data.parquet`) for file-skip on both axes.
 
 ## Running it
@@ -282,6 +299,33 @@ psql -h localhost -p 5432 -d rdb -c "SELECT symbol, COUNT(*) FROM trades GROUP B
 # At end of day — snapshot live tables to Parquet.
 ./target/release/hdb-rollup --hdb-dir ./hdb
 ```
+
+## Multi-host deployment (zenoh-bridge)
+
+On the **tickerplant host**, start the outbound bridge after the tickerplant:
+
+```bash
+# LAN — zenoh uses multicast scouting; no config needed.
+./target/release/zenoh-bridge --mode outbound
+
+# WAN / router-based — supply a zenoh config pointing at a router.
+./target/release/zenoh-bridge --mode outbound --zenoh-config zenoh-router.json5
+```
+
+On each **remote rdb host**, start the inbound bridge before the rdb:
+
+```bash
+./target/release/zenoh-bridge --mode inbound
+./target/release/rdb --symbols config/symbols.toml
+```
+
+The inbound bridge injects arriving `agg` messages into the local iceoryx2
+bus; the rdb subscribes to them exactly as if a local tickerplant were running.
+The same-host pipeline (feed-replayer, tickerplant, local rdb) is entirely
+unaffected.
+
+For zenoh router configuration and cross-subnet deployments, see the
+[zenoh documentation](https://zenoh.io/docs/getting-started/deployment/).
 
 ## Tests
 
