@@ -451,7 +451,7 @@ fn stream_trades(
         if due {
             let rb = trades_to_batch(&buf, stores)?;
             let payload = encode_ipc_stream(&[rb], &stores.trades_schema)?;
-            if query_proto::write_response(stream, query_proto::STATUS_BATCH, &payload).is_err() {
+            if query_proto::write_response(&mut *stream, query_proto::STATUS_BATCH, &payload).is_err() {
                 break;
             }
             buf.clear();
@@ -487,7 +487,7 @@ fn stream_quotes(
         if due {
             let rb = quotes_to_batch(&buf, stores)?;
             let payload = encode_ipc_stream(&[rb], &stores.quotes_schema)?;
-            if query_proto::write_response(stream, query_proto::STATUS_BATCH, &payload).is_err() {
+            if query_proto::write_response(&mut *stream, query_proto::STATUS_BATCH, &payload).is_err() {
                 break;
             }
             buf.clear();

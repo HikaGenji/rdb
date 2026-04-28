@@ -71,7 +71,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 /// Read frames until the server disconnects or sends ERR. The first frame
 /// is the OK ack; subsequent frames carry STATUS_BATCH with Arrow IPC.
 fn run_subscribe_client(stream: &mut UnixStream) -> anyhow::Result<()> {
-    let (status, payload) = query_proto::read_response(stream)?;
+    let (status, payload) = query_proto::read_response(&mut *stream)?;
     match status {
         query_proto::STATUS_OK => {
             eprintln!("subscribed; press Ctrl-C to stop");
@@ -89,7 +89,7 @@ fn run_subscribe_client(stream: &mut UnixStream) -> anyhow::Result<()> {
     }
 
     loop {
-        let (status, payload) = match query_proto::read_response(stream) {
+        let (status, payload) = match query_proto::read_response(&mut *stream) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
