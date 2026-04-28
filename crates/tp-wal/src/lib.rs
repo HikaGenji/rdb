@@ -69,6 +69,69 @@ impl<T: Pod + Zeroable> WalWriter<T> {
         })
     }
 
+    /// Open an existing WAL file for append, preserving previous records.
+    /// Falls back to [`create_with_chunk`] if the file does not exist.
+    pub fn open_or_create(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_or_create_with_chunk(path, DEFAULT_GROW_CHUNK)
+    }
+
+    pub fn open_or_create_with_chunk(
+        path: impl AsRef<Path>,
+        grow_chunk_bytes: usize,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let exists = path.exists();
+        if !exists {
+            return Self::create_with_chunk(&path, grow_chunk_bytes);
+        }
+
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let file_len = file.metadata()?.len();
+        if (file_len as usize) < HEADER_SIZE {
+            anyhow::bail!("wal file too short: {}", path.display());
+        }
+
+        // If finalize() trimmed the file to exactly count records, the mmap
+        // has zero slack — grow once so the next append doesn't fault.
+        let mut mapped_len = file_len as usize;
+        let record_size = std::mem::size_of::<T>();
+        let header_capacity_bytes = mapped_len.saturating_sub(HEADER_SIZE);
+        let need_grow = header_capacity_bytes < record_size;
+        if need_grow {
+            let new_len = (mapped_len + grow_chunk_bytes) as u64;
+            file.set_len(new_len)?;
+            mapped_len = new_len as usize;
+        }
+
+        let mmap = unsafe { MmapOptions::new().len(mapped_len).map_mut(&file)? };
+        let hdr: &WalHeader = bytemuck::from_bytes(&mmap[..HEADER_SIZE]);
+        if hdr.magic != MAGIC {
+            anyhow::bail!("wal magic mismatch: {}", path.display());
+        }
+        if hdr.record_size as usize != record_size {
+            anyhow::bail!(
+                "wal record size {} does not match T size {} ({})",
+                hdr.record_size,
+                record_size,
+                path.display()
+            );
+        }
+
+        let capacity_records = (mapped_len - HEADER_SIZE) / record_size;
+        Ok(Self {
+            path,
+            file,
+            mmap,
+            capacity_records,
+            grow_chunk_bytes,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
     fn header(&self) -> &WalHeader {
         bytemuck::from_bytes(&self.mmap[..HEADER_SIZE])
     }
@@ -116,6 +179,15 @@ impl<T: Pod + Zeroable> WalWriter<T> {
 
     pub fn flush(&mut self) -> anyhow::Result<()> {
         self.mmap.flush()?;
+        Ok(())
+    }
+
+    /// Synchronous, durable flush: msync(MS_SYNC) + fdatasync. Use this for
+    /// group-commit; it blocks until the kernel reports the bytes are on
+    /// stable storage.
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        self.mmap.flush()?;
+        self.file.sync_data()?;
         Ok(())
     }
 
@@ -188,8 +260,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn open_or_create_resumes_count() {
+        let dir = tempdir();
+        let p = dir.join("resume.wal");
+        {
+            let mut w: WalWriter<R> = WalWriter::create_with_chunk(&p, 256).unwrap();
+            for i in 0..50u64 {
+                w.append(&R { a: i, b: i }).unwrap();
+            }
+            w.sync().unwrap();
+            w.finalize().unwrap();
+        }
+        let mut w: WalWriter<R> = WalWriter::open_or_create_with_chunk(&p, 256).unwrap();
+        assert_eq!(w.count(), 50, "resumed WAL must report previous count");
+        for i in 50..120u64 {
+            w.append(&R { a: i, b: i }).unwrap();
+        }
+        w.finalize().unwrap();
+        let recs: Vec<R> = read_all(&p).unwrap();
+        assert_eq!(recs.len(), 120);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.a, i as u64);
+        }
+    }
+
+    #[test]
+    fn open_or_create_creates_when_missing() {
+        let dir = tempdir();
+        let p = dir.join("fresh.wal");
+        let mut w: WalWriter<R> = WalWriter::open_or_create_with_chunk(&p, 64).unwrap();
+        assert_eq!(w.count(), 0);
+        w.append(&R { a: 1, b: 2 }).unwrap();
+        w.finalize().unwrap();
+        let recs: Vec<R> = read_all(&p).unwrap();
+        assert_eq!(recs.len(), 1);
+    }
+
     fn tempdir() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("tp-wal-{}", std::process::id()));
+        // Unique per (pid, nanos) so concurrent tests in the same process
+        // don't collide on the same scratch directory.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("tp-wal-{}-{}", std::process::id(), nanos));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p

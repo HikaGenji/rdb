@@ -41,6 +41,16 @@ pub struct Args {
     /// Capacity (samples) for each per-hop latency histogram.
     #[arg(long, default_value_t = 4096)]
     hist_capacity: usize,
+
+    /// Group-commit batch size: call fsync after this many appends. 0
+    /// disables count-based fsync (fall back to the timer).
+    #[arg(long, default_value_t = 64)]
+    wal_fsync_batch: u64,
+
+    /// Group-commit timer: call fsync at least this often, in milliseconds.
+    /// 0 disables the timer (fall back to count-based fsync).
+    #[arg(long, default_value_t = 10)]
+    wal_fsync_interval_ms: u64,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -51,11 +61,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     std::fs::create_dir_all(&args.wal_dir)?;
     let trade_wal_path = args.wal_dir.join("trades.wal");
     let quote_wal_path = args.wal_dir.join("quotes.wal");
-    let mut trade_wal: WalWriter<Trade> = WalWriter::create(&trade_wal_path)?;
-    let mut quote_wal: WalWriter<QuoteL1> = WalWriter::create(&quote_wal_path)?;
+    let mut trade_wal: WalWriter<Trade> = WalWriter::open_or_create(&trade_wal_path)?;
+    let mut quote_wal: WalWriter<QuoteL1> = WalWriter::open_or_create(&quote_wal_path)?;
     info!(
         trade_wal = %trade_wal_path.display(),
         quote_wal = %quote_wal_path.display(),
+        trade_wal_count = trade_wal.count(),
+        quote_wal_count = quote_wal.count(),
         "WAL files opened"
     );
 
@@ -101,11 +113,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let trade_lat = LatencyHistogram::new(args.hist_capacity);
     let quote_lat = LatencyHistogram::new(args.hist_capacity);
 
-    let mut trade_seq: u64 = 0;
-    let mut quote_seq: u64 = 0;
+    // Resume per-stream sequence numbers from the WAL count so a restart
+    // does not produce overlapping seq values.
+    let mut trade_seq: u64 = trade_wal.count();
+    let mut quote_seq: u64 = quote_wal.count();
     let mut last_msg_at = wall_ns();
     let mut last_log_at = wall_ns();
+    let mut last_fsync_at = wall_ns();
+    let mut unflushed_appends: u64 = 0;
     let log_period_ns = 1_000_000_000u64;
+    let fsync_interval_ns = args.wal_fsync_interval_ms.saturating_mul(1_000_000);
 
     let idle_sleep = Duration::from_micros(args.idle_sleep_us);
     let idle_exit_ns = args.idle_exit_secs.saturating_mul(1_000_000_000);
@@ -120,6 +137,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             trade_seq += 1;
             trade.seq = trade_seq;
             trade_wal.append(&trade)?;
+            unflushed_appends += 1;
             let s = trade_pub.loan_uninit()?.write_payload(trade);
             s.send()?;
             did_work = true;
@@ -132,12 +150,24 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             quote_seq += 1;
             q.seq = quote_seq;
             quote_wal.append(&q)?;
+            unflushed_appends += 1;
             let s = quote_pub.loan_uninit()?.write_payload(q);
             s.send()?;
             did_work = true;
         }
 
         let now = wall_ns();
+        let due_by_count = args.wal_fsync_batch > 0 && unflushed_appends >= args.wal_fsync_batch;
+        let due_by_timer = fsync_interval_ns > 0
+            && unflushed_appends > 0
+            && now.saturating_sub(last_fsync_at) >= fsync_interval_ns;
+        if due_by_count || due_by_timer {
+            trade_wal.sync()?;
+            quote_wal.sync()?;
+            unflushed_appends = 0;
+            last_fsync_at = now;
+        }
+
         if did_work {
             last_msg_at = now;
         } else if idle_exit_ns != 0 && now.saturating_sub(last_msg_at) > idle_exit_ns {
@@ -163,6 +193,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             );
             last_log_at = now;
         }
+    }
+
+    if unflushed_appends > 0 {
+        trade_wal.sync()?;
+        quote_wal.sync()?;
     }
 
     info!(trade_seq, quote_seq, "tickerplant finalising WALs");

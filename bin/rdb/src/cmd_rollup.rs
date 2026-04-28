@@ -85,21 +85,40 @@ fn write_parquet(batches: &[RecordBatch], dir: &Path, date: &str) -> anyhow::Res
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
 
-    for sym in &symbols {
-        let sym_dir = dir.join(format!("date={date}")).join(format!("symbol={sym}"));
-        std::fs::create_dir_all(&sym_dir)
-            .with_context(|| format!("creating {}", sym_dir.display()))?;
-        let out_path = sym_dir.join("data.parquet");
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(symbols.len());
 
-        let copy_sql = format!(
-            "COPY (SELECT * EXCLUDE (symbol) FROM _data WHERE symbol = {}) \
-             TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-            sql_quote(sym),
-            out_path.display()
-        );
-        conn.execute_batch(&copy_sql)
-            .with_context(|| format!("writing {}", out_path.display()))?;
-        eprintln!("  wrote {}", out_path.display());
+    let result = (|| -> anyhow::Result<()> {
+        for sym in &symbols {
+            let sym_dir = dir.join(format!("date={date}")).join(format!("symbol={sym}"));
+            std::fs::create_dir_all(&sym_dir)
+                .with_context(|| format!("creating {}", sym_dir.display()))?;
+            let out_path = sym_dir.join("data.parquet");
+            let tmp_path = sym_dir.join("data.parquet.tmp");
+
+            let copy_sql = format!(
+                "COPY (SELECT * EXCLUDE (symbol) FROM _data WHERE symbol = {}) \
+                 TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                sql_quote(sym),
+                tmp_path.display()
+            );
+            conn.execute_batch(&copy_sql)
+                .with_context(|| format!("writing {}", tmp_path.display()))?;
+            staged.push((tmp_path, out_path));
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        for (tmp, _) in &staged {
+            let _ = std::fs::remove_file(tmp);
+        }
+        return Err(e);
+    }
+
+    for (tmp, out) in &staged {
+        std::fs::rename(tmp, out)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), out.display()))?;
+        eprintln!("  wrote {}", out.display());
     }
 
     Ok(())

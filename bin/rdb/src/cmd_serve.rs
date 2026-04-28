@@ -22,6 +22,7 @@ use tp_config::SymbolTable;
 use tp_types::{
     ipc_cfg, metrics::LatencyHistogram, query_proto, topics, wall_ns, QuoteL1, Trade,
 };
+use tp_wal as wal;
 
 use crate::sql_guard;
 
@@ -75,6 +76,18 @@ pub struct Args {
     /// Histogram capacity per latency hop.
     #[arg(long, default_value_t = 4096)]
     hist_capacity: usize,
+
+    /// Tickerplant WAL directory. When set, on startup the server reads
+    /// `<dir>/trades.wal` and `<dir>/quotes.wal` and replays each record
+    /// into the in-memory stores before opening the iceoryx2 subscribers.
+    /// Records older than `--wal-replay-since-secs` (when set) are skipped.
+    #[arg(long)]
+    wal_dir: Option<PathBuf>,
+
+    /// When `--wal-dir` is set, only replay records whose `ts_local_ns`
+    /// is within this many seconds of `now`. 0 = replay everything.
+    #[arg(long, default_value_t = 0)]
+    wal_replay_since_secs: u64,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -82,6 +95,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .with_context(|| format!("loading symbols {}", args.symbols.display()))?;
     let stores = Arc::new(StoreSet::from_symbols(&symbols));
     info!(symbol_count = symbols.len(), "loaded symbols");
+
+    if let Some(wal_dir) = args.wal_dir.as_ref() {
+        replay_wal(wal_dir, &stores, args.row_cap, args.wal_replay_since_secs)
+            .with_context(|| format!("replaying WAL from {}", wal_dir.display()))?;
+    }
 
     let trade_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
     let quote_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
@@ -322,6 +340,84 @@ fn has_parquet_files(dir: &Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// WAL replay
+// ---------------------------------------------------------------------------
+
+fn replay_wal(
+    wal_dir: &Path,
+    stores: &StoreSet,
+    row_cap: usize,
+    since_secs: u64,
+) -> anyhow::Result<()> {
+    let trade_path = wal_dir.join("trades.wal");
+    let quote_path = wal_dir.join("quotes.wal");
+    if !trade_path.exists() && !quote_path.exists() {
+        info!(wal_dir = %wal_dir.display(), "no WAL files to replay");
+        return Ok(());
+    }
+
+    let cutoff_ns: u64 = if since_secs == 0 {
+        0
+    } else {
+        wall_ns().saturating_sub(since_secs.saturating_mul(1_000_000_000))
+    };
+
+    let mut trade_replayed = 0u64;
+    let mut trade_skipped_old = 0u64;
+    let mut trade_unknown_sym = 0u64;
+    if trade_path.exists() {
+        let trades = wal::read_all::<Trade>(&trade_path)
+            .with_context(|| format!("reading {}", trade_path.display()))?;
+        for t in &trades {
+            if cutoff_ns > 0 && t.ts_local_ns < cutoff_ns {
+                trade_skipped_old += 1;
+                continue;
+            }
+            match stores.store_for(t.symbol_id) {
+                Some(store) => {
+                    store.trades.lock().push(t, row_cap);
+                    trade_replayed += 1;
+                }
+                None => trade_unknown_sym += 1,
+            }
+        }
+    }
+
+    let mut quote_replayed = 0u64;
+    let mut quote_skipped_old = 0u64;
+    let mut quote_unknown_sym = 0u64;
+    if quote_path.exists() {
+        let quotes = wal::read_all::<QuoteL1>(&quote_path)
+            .with_context(|| format!("reading {}", quote_path.display()))?;
+        for q in &quotes {
+            if cutoff_ns > 0 && q.ts_local_ns < cutoff_ns {
+                quote_skipped_old += 1;
+                continue;
+            }
+            match stores.store_for(q.symbol_id) {
+                Some(store) => {
+                    store.quotes.lock().push(q, row_cap);
+                    quote_replayed += 1;
+                }
+                None => quote_unknown_sym += 1,
+            }
+        }
+    }
+
+    info!(
+        wal_dir = %wal_dir.display(),
+        trade_replayed,
+        trade_skipped_old,
+        trade_unknown_sym,
+        quote_replayed,
+        quote_skipped_old,
+        quote_unknown_sym,
+        "WAL replay complete"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

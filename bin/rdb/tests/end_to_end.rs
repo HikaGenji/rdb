@@ -311,6 +311,92 @@ fn spawn_serve(symbols: &Path, socket: &Path, db: &Path) -> ChildGuard {
 }
 
 #[test]
+fn wal_replay_restores_in_memory_rows_after_restart() {
+    // Phase 1: run tickerplant + replayer with `--wal-dir`. No rdb is
+    // listening so the */agg samples are simply dropped — only the WAL
+    // files matter.
+    // Phase 2: start `rdb serve --wal-dir <same dir>` with no live ingest
+    // and confirm the in-memory store reflects the replayed records.
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_binaries_built();
+
+    let scratch = ScratchDir::new("wal-replay");
+    let symbols = workspace_root().join("config/symbols.toml");
+    let sample  = workspace_root().join("samples/sample.jsonl");
+    assert!(symbols.exists(), "config/symbols.toml not found");
+    assert!(sample.exists(), "samples/sample.jsonl not found");
+
+    let wal_dir = scratch.path.join("wal");
+    let socket  = scratch.path.join("rdb.sock");
+    let db      = scratch.path.join("rdb.duckdb");
+
+    let _ = std::fs::remove_dir_all("/tmp/iceoryx2");
+
+    // --- Phase 1: populate the WAL ---
+    let mut tp = rdb_cmd("tickerplant");
+    tp.arg("--symbols").arg(&symbols)
+      .arg("--wal-dir").arg(&wal_dir)
+      .arg("--idle-exit-secs").arg("3")
+      // Force every append to fsync, so even in this short-lived test the
+      // WAL is on stable storage by the time the tickerplant exits.
+      .arg("--wal-fsync-batch").arg("1")
+      .env("RUST_LOG", "warn");
+    let tp = ChildGuard::new(tp.spawn().expect("spawn rdb tickerplant"));
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut fr = rdb_cmd("feed-replayer");
+    fr.arg("--symbols").arg(&symbols)
+      .arg("--input").arg(&sample)
+      .arg("--pace").arg("firehose")
+      .env("RUST_LOG", "warn");
+    let fr = ChildGuard::new(fr.spawn().expect("spawn rdb feed-replayer"));
+
+    let fr_status = fr.wait().expect("wait fr");
+    assert!(fr_status.success(), "feed-replayer failed: {fr_status:?}");
+    let tp_status = tp.wait().expect("wait tp");
+    assert!(tp_status.success(), "tickerplant failed: {tp_status:?}");
+
+    // The WAL files must exist and be non-empty.
+    let trades_wal = wal_dir.join("trades.wal");
+    let quotes_wal = wal_dir.join("quotes.wal");
+    assert!(trades_wal.exists(), "trades.wal not created");
+    assert!(quotes_wal.exists(), "quotes.wal not created");
+
+    // Clear the iceoryx2 segments so the new serve starts clean — no
+    // leftover */agg subscribers from the prior tickerplant run.
+    let _ = std::fs::remove_dir_all("/tmp/iceoryx2");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // --- Phase 2: start a fresh rdb pointed at the WAL dir ---
+    let mut rdb = rdb_cmd("serve");
+    rdb.arg("--symbols").arg(&symbols)
+       .arg("--socket").arg(&socket)
+       .arg("--db").arg(&db)
+       .arg("--wal-dir").arg(&wal_dir)
+       .arg("--idle-exit-secs").arg("3")
+       .env("RUST_LOG", "warn");
+    let mut rdb = ChildGuard::new(rdb.spawn().expect("spawn rdb serve"));
+
+    assert!(
+        wait_for_socket(&socket, Duration::from_secs(5)),
+        "rdb socket did not appear at {}", socket.display()
+    );
+
+    let count = query(&socket, "SELECT COUNT(*)::BIGINT FROM trades").unwrap();
+    let n = count[0].column(0).as_any()
+        .downcast_ref::<arrow_array::Int64Array>().unwrap().value(0);
+    assert_eq!(n, 6, "expected 6 trades replayed from WAL, got {n}");
+
+    let qcount = query(&socket, "SELECT COUNT(*)::BIGINT FROM quotes").unwrap();
+    let qn = qcount[0].column(0).as_any()
+        .downcast_ref::<arrow_array::Int64Array>().unwrap().value(0);
+    assert!(qn > 0, "expected at least one quote replayed, got {qn}");
+
+    rdb.kill();
+}
+
+#[test]
 fn create_table_persists_and_guard_protects_streaming_views() {
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     ensure_binaries_built();
