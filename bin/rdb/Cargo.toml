@@ -29,6 +29,7 @@ iceoryx2           = { workspace = true }
 zenoh              = { workspace = true }
 tokio              = { workspace = true }
 duckdb             = { workspace = true, features = ["vtab-arrow", "bundled"] }
+sqlparser          = { workspace = true }
 arrow              = { workspace = true }
 arrow-array        = { workspace = true }
 arrow-schema       = { workspace = true }

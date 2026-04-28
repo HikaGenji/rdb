@@ -24,6 +24,7 @@ mod cmd_replay;
 mod cmd_rollup;
 mod cmd_serve;
 mod cmd_tickerplant;
+mod sql_guard;
 mod tracing_init;
 
 use clap::{Parser, Subcommand};

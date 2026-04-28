@@ -23,6 +23,8 @@ use tp_types::{
     ipc_cfg, metrics::LatencyHistogram, query_proto, topics, wall_ns, QuoteL1, Trade,
 };
 
+use crate::sql_guard;
+
 #[derive(clap::Args, Debug)]
 pub struct Args {
     /// Symbols TOML file.
@@ -38,6 +40,13 @@ pub struct Args {
     /// the live in-memory tables using Hive partitioning.
     #[arg(long)]
     hdb: Option<PathBuf>,
+
+    /// Persistent DuckDB file backing the user catalog. User-issued DDL
+    /// (`CREATE TABLE`, `INSERT`, …) lands here and survives restarts. The
+    /// streaming `trades`/`quotes` fixtures are mounted as temp views per
+    /// query and never touch this file.
+    #[arg(long, default_value = "data/rdb.duckdb")]
+    db: PathBuf,
 
     /// Number of persistent DuckDB query workers.
     #[arg(long, default_value_t = 4)]
@@ -90,9 +99,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         info!(hdb = %hdb.display(), "HDB directory configured");
     }
 
-    let pool = ConnPool::new(args.query_workers)
-        .context("initialising DuckDB connection pool")?;
-    info!(workers = args.query_workers, "DuckDB connection pool ready");
+    if let Some(parent) = args.db.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    let pool = ConnPool::new(args.query_workers, &args.db)
+        .with_context(|| format!("initialising DuckDB connection pool on {}", args.db.display()))?;
+    info!(
+        workers = args.query_workers,
+        db = %args.db.display(),
+        "DuckDB connection pool ready"
+    );
 
     if args.rollup_interval_secs > 0 {
         match &hdb_dir {
@@ -131,13 +150,20 @@ struct ConnPool {
 }
 
 impl ConnPool {
-    fn new(size: usize) -> anyhow::Result<Arc<Self>> {
+    fn new(size: usize, db_path: &Path) -> anyhow::Result<Arc<Self>> {
         let (tx, rx) = chan::bounded(size);
-        for _ in 0..size {
-            let conn = Connection::open_in_memory()?;
+        // Open one root connection to the persistent file; additional workers
+        // share the same Database handle via try_clone so they all see the
+        // same catalog (CREATE TABLE on one worker is visible to all).
+        let root = Connection::open(db_path)
+            .with_context(|| format!("opening DuckDB at {}", db_path.display()))?;
+        root.register_table_function::<ArrowVTab>("arrow")?;
+        for _ in 1..size {
+            let conn = root.try_clone()?;
             conn.register_table_function::<ArrowVTab>("arrow")?;
             tx.send(conn).unwrap();
         }
+        tx.send(root).unwrap();
         Ok(Arc::new(Self { tx, rx }))
     }
 
@@ -204,13 +230,18 @@ fn handle_connection(
 }
 
 fn run_query(sql: &str, stores: &StoreSet, hdb_dir: Option<&Path>, conn: &Connection) -> anyhow::Result<Vec<u8>> {
+    sql_guard::check(sql)?;
+
     let trades_rb = stores.snapshot_trades()?;
     let quotes_rb = stores.snapshot_quotes()?;
 
+    // Reset only the temp namespace — user catalog objects in the persistent
+    // database are untouched. Every streaming fixture below is created in
+    // `temp.` so this DROP is the inverse of the (re)creation that follows.
     conn.execute_batch(
-        "DROP TABLE  IF EXISTS trades_live;  DROP TABLE  IF EXISTS quotes_live;
-         DROP VIEW   IF EXISTS trades_hist;  DROP VIEW   IF EXISTS quotes_hist;
-         DROP VIEW   IF EXISTS trades;       DROP VIEW   IF EXISTS quotes;",
+        "DROP TABLE IF EXISTS temp.trades_live; DROP TABLE IF EXISTS temp.quotes_live;
+         DROP VIEW  IF EXISTS temp.trades_hist; DROP VIEW  IF EXISTS temp.quotes_hist;
+         DROP VIEW  IF EXISTS temp.trades;      DROP VIEW  IF EXISTS temp.quotes;",
     )?;
 
     create_arrow_table(conn, "trades_live", trades_rb)?;
@@ -253,15 +284,15 @@ fn build_union_view(name: &str, hdb_dir: Option<&Path>) -> String {
         let glob = hdb_dir.unwrap().join(name).join("**").join("*.parquet");
         let cols = hist_columns(name);
         format!(
-            "CREATE VIEW {name}_hist AS \
+            "CREATE TEMP VIEW {name}_hist AS \
                SELECT {cols} \
                FROM read_parquet('{glob}', hive_partitioning=true);\n\
-             CREATE VIEW {name} AS \
+             CREATE TEMP VIEW {name} AS \
                SELECT * FROM {live} UNION ALL SELECT * FROM {name}_hist;",
             glob = glob.display(),
         )
     } else {
-        format!("CREATE VIEW {name} AS SELECT * FROM {live};")
+        format!("CREATE TEMP VIEW {name} AS SELECT * FROM {live};")
     }
 }
 
