@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Float64Array, RecordBatch, StringArray, UInt64Array};
 use tp_arrow::decode_ipc_stream;
+use tp_types::query_proto;
 
 const REQ_OK: u8 = 0;
 const REQ_ERR: u8 = 1;
@@ -429,6 +430,100 @@ fn wal_replay_restores_in_memory_rows_after_restart() {
         .downcast_ref::<arrow_array::Int64Array>().unwrap().value(0);
     assert!(qn > 0, "expected at least one quote replayed, got {qn}");
 
+    rdb.kill();
+}
+
+#[test]
+fn subscribe_trades_streams_batches() {
+    // Open a SUBSCRIBE trades connection, then drive the feed; expect the
+    // server to push at least one Arrow IPC batch with rows that match the
+    // sample feed.
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_binaries_built();
+
+    let scratch = ScratchDir::new("subscribe");
+    let symbols = workspace_root().join("config/symbols.toml");
+    let sample  = workspace_root().join("samples/sample.jsonl");
+    assert!(symbols.exists());
+    assert!(sample.exists());
+
+    let socket = scratch.path.join("rdb.sock");
+    let db     = scratch.path.join("rdb.duckdb");
+    let _ = std::fs::remove_dir_all("/tmp/iceoryx2");
+
+    let mut rdb = rdb_cmd("serve");
+    rdb.arg("--symbols").arg(&symbols)
+       .arg("--socket").arg(&socket)
+       .arg("--db").arg(&db)
+       .arg("--idle-exit-secs").arg("4")
+       .env("RUST_LOG", "warn");
+    let mut rdb = ChildGuard::new(rdb.spawn().expect("spawn rdb serve"));
+    assert!(wait_for_socket(&socket, Duration::from_secs(5)));
+
+    // Open the subscribe socket BEFORE the feed starts so we don't miss
+    // records.
+    let mut sub_stream = UnixStream::connect(&socket).expect("connect subscribe");
+    let sql = "SUBSCRIBE trades";
+    let bytes = sql.as_bytes();
+    sub_stream.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+    sub_stream.write_all(bytes).unwrap();
+    sub_stream.flush().unwrap();
+    // Read OK ack.
+    let mut s = [0u8; 1];
+    sub_stream.read_exact(&mut s).unwrap();
+    assert_eq!(s[0], REQ_OK, "expected OK ack");
+    let mut len_buf = [0u8; 4];
+    sub_stream.read_exact(&mut len_buf).unwrap();
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    sub_stream.read_exact(&mut payload).unwrap();
+
+    // Now drive the feed.
+    let mut tp = rdb_cmd("tickerplant");
+    tp.arg("--symbols").arg(&symbols)
+      .arg("--wal-dir").arg(scratch.path.join("wal"))
+      .arg("--idle-exit-secs").arg("3")
+      .env("RUST_LOG", "warn");
+    let tp = ChildGuard::new(tp.spawn().expect("spawn tickerplant"));
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut fr = rdb_cmd("feed-replayer");
+    fr.arg("--symbols").arg(&symbols)
+      .arg("--input").arg(&sample)
+      .arg("--pace").arg("firehose")
+      .env("RUST_LOG", "warn");
+    let fr = ChildGuard::new(fr.spawn().expect("spawn replayer"));
+    fr.wait().expect("wait fr").success().then_some(()).expect("fr success");
+    tp.wait().expect("wait tp").success().then_some(()).expect("tp success");
+
+    // Set a read timeout so we don't hang if no batch arrives.
+    sub_stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    // Pull batch frames until we accumulate the 6 expected trade rows.
+    let mut total_rows = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while total_rows < 6 && Instant::now() < deadline {
+        let mut s = [0u8; 1];
+        if sub_stream.read_exact(&mut s).is_err() { break; }
+        let mut len_buf = [0u8; 4];
+        sub_stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        sub_stream.read_exact(&mut payload).unwrap();
+        match s[0] {
+            query_proto::STATUS_BATCH => {
+                let batches = decode_ipc_stream(&payload).unwrap();
+                total_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+            query_proto::STATUS_ERR => {
+                panic!("server error: {}", String::from_utf8_lossy(&payload));
+            }
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(total_rows, 6, "expected 6 streamed trade rows, got {total_rows}");
+
+    drop(sub_stream);
     rdb.kill();
 }
 

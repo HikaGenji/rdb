@@ -125,6 +125,23 @@ trades_bars(symbol Utf8, symbol_id u32, ts_bucket_ns u64,
 Queries can use the full DuckDB SQL surface, including `ASOF JOIN` and
 Parquet predicate-pushdown when filtering on timestamp columns.
 
+### Streaming subscribe
+
+Send `SUBSCRIBE trades` or `SUBSCRIBE quotes` instead of a regular SELECT
+and the server keeps the connection open, pushing every newly ingested
+record as an Arrow IPC batch (flushed every 256 rows or every 50 ms,
+whichever comes first). The CLI auto-detects subscribe and prints
+batches until SIGINT:
+
+```bash
+rdb query --sql "SUBSCRIBE trades"
+```
+
+Subscribers are bounded — a slow consumer drops records (the rdb skips a
+batch and moves on) but is never blocked-out. Streaming uses status byte
+`STATUS_BATCH = 2` on the response framing; see
+`crates/tp-types/src/query_proto.rs` for the wire format.
+
 ## Historical database (HDB)
 
 At the end of each trading session, run `rdb hdb-rollup` to snapshot the

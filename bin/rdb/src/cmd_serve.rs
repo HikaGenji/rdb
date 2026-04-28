@@ -7,10 +7,10 @@
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use crossbeam_channel as chan;
 use duckdb::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
 use duckdb::Connection;
@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use tp_arrow::{encode_ipc_stream, StoreSet};
 use tp_config::SymbolTable;
 use tp_types::{
-    ipc_cfg, metrics::LatencyHistogram, query_proto, topics, wall_ns, QuoteL1, Trade,
+    ipc_cfg, metrics::LatencyHistogram, query_proto, topics, wall_ns, QuoteL1, Side, Trade,
 };
 use tp_wal as wal;
 
@@ -167,15 +167,66 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    let hub = Arc::new(SubscriberHub::default());
+
     let stores_q = stores.clone();
+    let hub_q = hub.clone();
     let bars_enabled = bar_interval_ns > 0;
     let _query_thread = std::thread::Builder::new()
         .name("rdb-query".into())
         .spawn(move || {
-            run_query_server(listener, stores_q, hdb_dir, pool, bars_enabled);
+            run_query_server(listener, stores_q, hdb_dir, pool, bars_enabled, hub_q);
         })?;
 
-    run_ingest_loop(args, stores, trade_lat, quote_lat, bar_interval_ns, bar_row_cap)
+    run_ingest_loop(args, stores, trade_lat, quote_lat, bar_interval_ns, bar_row_cap, hub)
+}
+
+// ---------------------------------------------------------------------------
+// Subscriber hub — fan-out from ingest to streaming SUBSCRIBE clients
+// ---------------------------------------------------------------------------
+
+/// Unbounded? No — we use bounded channels so a slow subscriber simply drops
+/// records (the broadcaster `try_send`s, treating Full as "skip this row but
+/// keep the subscriber"). 16k records is ~1 MB at 64 B/record, generous for
+/// burstiness without letting a stuck client run the server out of memory.
+const SUBSCRIBER_QUEUE_CAP: usize = 16_384;
+
+#[derive(Default)]
+struct SubscriberHub {
+    trades: parking_lot::Mutex<Vec<chan::Sender<Trade>>>,
+    quotes: parking_lot::Mutex<Vec<chan::Sender<QuoteL1>>>,
+}
+
+impl SubscriberHub {
+    fn subscribe_trades(&self) -> chan::Receiver<Trade> {
+        let (tx, rx) = chan::bounded(SUBSCRIBER_QUEUE_CAP);
+        self.trades.lock().push(tx);
+        rx
+    }
+
+    fn subscribe_quotes(&self) -> chan::Receiver<QuoteL1> {
+        let (tx, rx) = chan::bounded(SUBSCRIBER_QUEUE_CAP);
+        self.quotes.lock().push(tx);
+        rx
+    }
+
+    fn broadcast_trade(&self, t: &Trade) {
+        let mut subs = self.trades.lock();
+        subs.retain(|tx| match tx.try_send(*t) {
+            Ok(()) => true,
+            Err(chan::TrySendError::Full(_)) => true,
+            Err(chan::TrySendError::Disconnected(_)) => false,
+        });
+    }
+
+    fn broadcast_quote(&self, q: &QuoteL1) {
+        let mut subs = self.quotes.lock();
+        subs.retain(|tx| match tx.try_send(*q) {
+            Ok(()) => true,
+            Err(chan::TrySendError::Full(_)) => true,
+            Err(chan::TrySendError::Disconnected(_)) => false,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +275,7 @@ fn run_query_server(
     hdb_dir: Option<Arc<PathBuf>>,
     pool: Arc<ConnPool>,
     bars_enabled: bool,
+    hub: Arc<SubscriberHub>,
 ) {
     for incoming in listener.incoming() {
         match incoming {
@@ -231,8 +283,9 @@ fn run_query_server(
                 let stores = stores.clone();
                 let hdb_dir = hdb_dir.clone();
                 let pool = pool.clone();
+                let hub = hub.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, stores, hdb_dir, pool, bars_enabled) {
+                    if let Err(e) = handle_connection(stream, stores, hdb_dir, pool, bars_enabled, hub) {
                         warn!(error = %e, "query connection failed");
                     }
                 });
@@ -251,9 +304,14 @@ fn handle_connection(
     hdb_dir: Option<Arc<PathBuf>>,
     pool: Arc<ConnPool>,
     bars_enabled: bool,
+    hub: Arc<SubscriberHub>,
 ) -> anyhow::Result<()> {
     let sql = query_proto::read_request(&mut stream)?;
     info!(sql_chars = sql.len(), "query received");
+
+    if query_proto::looks_like_subscribe(&sql) {
+        return run_subscribe(stream, &sql, &stores, &hub);
+    }
 
     let conn = pool.acquire();
     let result = run_query(
@@ -318,6 +376,206 @@ fn create_arrow_table(conn: &Connection, name: &str, rb: RecordBatch) -> anyhow:
     let mut stmt = conn.prepare(&sql)?;
     stmt.execute(params)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming SUBSCRIBE handler
+// ---------------------------------------------------------------------------
+
+fn run_subscribe(
+    mut stream: UnixStream,
+    sql: &str,
+    stores: &StoreSet,
+    hub: &SubscriberHub,
+) -> anyhow::Result<()> {
+    let topic = parse_subscribe_topic(sql)?;
+    info!(topic, "subscribe accepted");
+    // Initial OK ack so the client can detect a successful subscription.
+    if query_proto::write_response(&mut stream, query_proto::STATUS_OK, &[]).is_err() {
+        return Ok(());
+    }
+    match topic.as_str() {
+        "trades" => stream_trades(&mut stream, stores, hub),
+        "quotes" => stream_quotes(&mut stream, stores, hub),
+        other => {
+            let msg = format!("subscribe: unknown topic '{other}' (try trades, quotes)");
+            let _ = query_proto::write_response(
+                &mut stream, query_proto::STATUS_ERR, msg.as_bytes(),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Parse `SUBSCRIBE <topic>` into the lower-case topic name.
+fn parse_subscribe_topic(sql: &str) -> anyhow::Result<String> {
+    let mut iter = sql.split_whitespace();
+    let verb = iter.next().unwrap_or("");
+    if !verb.eq_ignore_ascii_case("SUBSCRIBE") {
+        anyhow::bail!("not a SUBSCRIBE statement");
+    }
+    let topic = iter.next().unwrap_or("").trim_end_matches(';').to_ascii_lowercase();
+    if topic.is_empty() {
+        anyhow::bail!("SUBSCRIBE requires a topic name");
+    }
+    Ok(topic)
+}
+
+const STREAM_FLUSH_ROWS: usize = 256;
+const STREAM_FLUSH_MS:   u64   = 50;
+
+fn stream_trades(
+    stream: &mut UnixStream,
+    stores: &StoreSet,
+    hub: &SubscriberHub,
+) -> anyhow::Result<()> {
+    let rx = hub.subscribe_trades();
+    let mut buf: Vec<Trade> = Vec::with_capacity(STREAM_FLUSH_ROWS);
+    let mut last_flush = Instant::now();
+    let timeout = Duration::from_millis(STREAM_FLUSH_MS);
+    loop {
+        // Block for the first record, then drain the rest non-blockingly.
+        match rx.recv_timeout(timeout) {
+            Ok(t) => buf.push(t),
+            Err(chan::RecvTimeoutError::Timeout) => {}
+            Err(chan::RecvTimeoutError::Disconnected) => break,
+        }
+        while buf.len() < STREAM_FLUSH_ROWS {
+            match rx.try_recv() {
+                Ok(t) => buf.push(t),
+                Err(_) => break,
+            }
+        }
+        let due = !buf.is_empty()
+            && (buf.len() >= STREAM_FLUSH_ROWS || last_flush.elapsed() >= timeout);
+        if due {
+            let rb = trades_to_batch(&buf, stores)?;
+            let payload = encode_ipc_stream(&[rb], &stores.trades_schema)?;
+            if query_proto::write_response(stream, query_proto::STATUS_BATCH, &payload).is_err() {
+                break;
+            }
+            buf.clear();
+            last_flush = Instant::now();
+        }
+    }
+    Ok(())
+}
+
+fn stream_quotes(
+    stream: &mut UnixStream,
+    stores: &StoreSet,
+    hub: &SubscriberHub,
+) -> anyhow::Result<()> {
+    let rx = hub.subscribe_quotes();
+    let mut buf: Vec<QuoteL1> = Vec::with_capacity(STREAM_FLUSH_ROWS);
+    let mut last_flush = Instant::now();
+    let timeout = Duration::from_millis(STREAM_FLUSH_MS);
+    loop {
+        match rx.recv_timeout(timeout) {
+            Ok(q) => buf.push(q),
+            Err(chan::RecvTimeoutError::Timeout) => {}
+            Err(chan::RecvTimeoutError::Disconnected) => break,
+        }
+        while buf.len() < STREAM_FLUSH_ROWS {
+            match rx.try_recv() {
+                Ok(q) => buf.push(q),
+                Err(_) => break,
+            }
+        }
+        let due = !buf.is_empty()
+            && (buf.len() >= STREAM_FLUSH_ROWS || last_flush.elapsed() >= timeout);
+        if due {
+            let rb = quotes_to_batch(&buf, stores)?;
+            let payload = encode_ipc_stream(&[rb], &stores.quotes_schema)?;
+            if query_proto::write_response(stream, query_proto::STATUS_BATCH, &payload).is_err() {
+                break;
+            }
+            buf.clear();
+            last_flush = Instant::now();
+        }
+    }
+    Ok(())
+}
+
+fn trades_to_batch(rows: &[Trade], stores: &StoreSet) -> anyhow::Result<RecordBatch> {
+    let mut symbol = Vec::with_capacity(rows.len());
+    let mut symbol_id = Vec::with_capacity(rows.len());
+    let mut seq = Vec::with_capacity(rows.len());
+    let mut ts_exchange_ns = Vec::with_capacity(rows.len());
+    let mut ts_local_ns = Vec::with_capacity(rows.len());
+    let mut price = Vec::with_capacity(rows.len());
+    let mut qty = Vec::with_capacity(rows.len());
+    let mut side = Vec::with_capacity(rows.len());
+    for t in rows {
+        let store = match stores.store_for(t.symbol_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        symbol.push(store.symbol.clone());
+        symbol_id.push(t.symbol_id);
+        seq.push(t.seq);
+        ts_exchange_ns.push(t.ts_exchange_ns);
+        ts_local_ns.push(t.ts_local_ns);
+        price.push(decode_fixed_local(t.price, store.price_scale));
+        qty.push(decode_fixed_local(t.qty, store.qty_scale));
+        side.push(Side::from_u8(t.side).as_str().to_string());
+    }
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(symbol)),
+        Arc::new(UInt32Array::from(symbol_id)),
+        Arc::new(UInt64Array::from(seq)),
+        Arc::new(UInt64Array::from(ts_exchange_ns)),
+        Arc::new(UInt64Array::from(ts_local_ns)),
+        Arc::new(Float64Array::from(price)),
+        Arc::new(Float64Array::from(qty)),
+        Arc::new(StringArray::from(side)),
+    ];
+    Ok(RecordBatch::try_new(stores.trades_schema.clone(), arrays)?)
+}
+
+fn quotes_to_batch(rows: &[QuoteL1], stores: &StoreSet) -> anyhow::Result<RecordBatch> {
+    let mut symbol = Vec::with_capacity(rows.len());
+    let mut symbol_id = Vec::with_capacity(rows.len());
+    let mut seq = Vec::with_capacity(rows.len());
+    let mut ts_exchange_ns = Vec::with_capacity(rows.len());
+    let mut ts_local_ns = Vec::with_capacity(rows.len());
+    let mut bid_price = Vec::with_capacity(rows.len());
+    let mut bid_qty = Vec::with_capacity(rows.len());
+    let mut ask_price = Vec::with_capacity(rows.len());
+    let mut ask_qty = Vec::with_capacity(rows.len());
+    for q in rows {
+        let store = match stores.store_for(q.symbol_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        symbol.push(store.symbol.clone());
+        symbol_id.push(q.symbol_id);
+        seq.push(q.seq);
+        ts_exchange_ns.push(q.ts_exchange_ns);
+        ts_local_ns.push(q.ts_local_ns);
+        bid_price.push(decode_fixed_local(q.bid_price, store.price_scale));
+        bid_qty.push(decode_fixed_local(q.bid_qty, store.qty_scale));
+        ask_price.push(decode_fixed_local(q.ask_price, store.price_scale));
+        ask_qty.push(decode_fixed_local(q.ask_qty, store.qty_scale));
+    }
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(symbol)),
+        Arc::new(UInt32Array::from(symbol_id)),
+        Arc::new(UInt64Array::from(seq)),
+        Arc::new(UInt64Array::from(ts_exchange_ns)),
+        Arc::new(UInt64Array::from(ts_local_ns)),
+        Arc::new(Float64Array::from(bid_price)),
+        Arc::new(Float64Array::from(bid_qty)),
+        Arc::new(Float64Array::from(ask_price)),
+        Arc::new(Float64Array::from(ask_qty)),
+    ];
+    Ok(RecordBatch::try_new(stores.quotes_schema.clone(), arrays)?)
+}
+
+fn decode_fixed_local(v: i64, scale: u8) -> f64 {
+    let mut p = 1.0f64;
+    for _ in 0..scale { p *= 10.0; }
+    (v as f64) / p
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +730,7 @@ fn run_ingest_loop(
     quote_lat: Arc<LatencyHistogram>,
     bar_interval_ns: u64,
     bar_row_cap: usize,
+    hub: Arc<SubscriberHub>,
 ) -> anyhow::Result<()> {
     let row_cap = args.row_cap;
 
@@ -515,6 +774,7 @@ fn run_ingest_loop(
             if let Some(store) = stores.store_for(trade.symbol_id) {
                 store.push_trade(&trade, row_cap, bar_interval_ns, bar_row_cap);
                 trade_count += 1;
+                hub.broadcast_trade(&trade);
             } else {
                 warn!(symbol_id = trade.symbol_id, "trade for unknown symbol_id");
                 trade_lat.record_drop();
@@ -529,6 +789,7 @@ fn run_ingest_loop(
             if let Some(store) = stores.store_for(q.symbol_id) {
                 store.quotes.lock().push(&q, row_cap);
                 quote_count += 1;
+                hub.broadcast_quote(&q);
             } else {
                 warn!(symbol_id = q.symbol_id, "quote for unknown symbol_id");
                 quote_lat.record_drop();
