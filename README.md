@@ -100,6 +100,10 @@ trades        UNION ALL of trades_live + trades_hist
               (plain alias for trades_live when --hdb is not set)
 
 quotes_live / quotes_hist / quotes — same pattern
+
+trades_bars   live OHLCV bars maintained per tick (one row per
+              (symbol, ts_bucket_ns) bucket, default 60-second buckets)
+              — controlled by --bar-interval-secs on `rdb serve`.
 ```
 
 Column schemas:
@@ -112,6 +116,10 @@ trades(symbol Utf8, symbol_id u32, seq u64,
 quotes(symbol Utf8, symbol_id u32, seq u64,
        ts_exchange_ns u64, ts_local_ns u64,
        bid_price f64, bid_qty f64, ask_price f64, ask_qty f64)
+
+trades_bars(symbol Utf8, symbol_id u32, ts_bucket_ns u64,
+            open f64, high f64, low f64, close f64,
+            vwap f64, volume f64)
 ```
 
 Queries can use the full DuckDB SQL surface, including `ASOF JOIN` and

@@ -259,6 +259,42 @@ fn end_to_end_replay_and_asof() {
         .collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6], "trade seqs are not 1..=6");
 
+    // Online OHLCV bars are maintained per tick and must reflect the same
+    // VWAP as the raw trades, computed end-to-end.
+    let bar_batches = query(
+        &socket,
+        "SELECT symbol, COUNT(*) AS n_bars, SUM(volume) AS total_vol \
+         FROM trades_bars GROUP BY symbol ORDER BY symbol",
+    )
+    .unwrap();
+    let total_rows: usize = bar_batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows >= 1, "expected at least one bar, got {total_rows}");
+
+    // Cross-check: bar VWAP equals raw-trade VWAP per symbol.
+    let cross = query(
+        &socket,
+        "WITH \
+           raw AS (SELECT symbol, SUM(price*qty)/SUM(qty) AS vwap_raw \
+                   FROM trades GROUP BY symbol), \
+           bar AS (SELECT symbol, SUM(vwap*volume)/SUM(volume) AS vwap_bar \
+                   FROM trades_bars GROUP BY symbol) \
+         SELECT raw.symbol, raw.vwap_raw, bar.vwap_bar \
+         FROM raw JOIN bar USING (symbol) ORDER BY raw.symbol",
+    )
+    .unwrap();
+    for batch in &cross {
+        let raws = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let bars = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..batch.num_rows() {
+            assert!(
+                (raws.value(i) - bars.value(i)).abs() < 1e-6,
+                "vwap mismatch row {i}: raw={} bar={}",
+                raws.value(i),
+                bars.value(i)
+            );
+        }
+    }
+
     // Tear down rdb. Ingest will idle out after 3s; we can also kill it.
     rdb.kill();
 }

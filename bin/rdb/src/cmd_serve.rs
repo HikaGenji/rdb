@@ -88,6 +88,15 @@ pub struct Args {
     /// is within this many seconds of `now`. 0 = replay everything.
     #[arg(long, default_value_t = 0)]
     wal_replay_since_secs: u64,
+
+    /// Bucket size in seconds for the live OHLCV bars table
+    /// (`trades_bars`). 0 = bars disabled. Default 60.
+    #[arg(long, default_value_t = 60)]
+    bar_interval_secs: u64,
+
+    /// Per-symbol row cap on the bars table. 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    bar_row_cap: usize,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -96,9 +105,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let stores = Arc::new(StoreSet::from_symbols(&symbols));
     info!(symbol_count = symbols.len(), "loaded symbols");
 
+    let bar_interval_ns: u64 = args.bar_interval_secs.saturating_mul(1_000_000_000);
+    let bar_row_cap = args.bar_row_cap;
+
     if let Some(wal_dir) = args.wal_dir.as_ref() {
-        replay_wal(wal_dir, &stores, args.row_cap, args.wal_replay_since_secs)
-            .with_context(|| format!("replaying WAL from {}", wal_dir.display()))?;
+        replay_wal(
+            wal_dir,
+            &stores,
+            args.row_cap,
+            args.wal_replay_since_secs,
+            bar_interval_ns,
+            bar_row_cap,
+        )
+        .with_context(|| format!("replaying WAL from {}", wal_dir.display()))?;
     }
 
     let trade_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
@@ -149,13 +168,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let stores_q = stores.clone();
+    let bars_enabled = bar_interval_ns > 0;
     let _query_thread = std::thread::Builder::new()
         .name("rdb-query".into())
         .spawn(move || {
-            run_query_server(listener, stores_q, hdb_dir, pool);
+            run_query_server(listener, stores_q, hdb_dir, pool, bars_enabled);
         })?;
 
-    run_ingest_loop(args, stores, trade_lat, quote_lat)
+    run_ingest_loop(args, stores, trade_lat, quote_lat, bar_interval_ns, bar_row_cap)
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +223,7 @@ fn run_query_server(
     stores: Arc<StoreSet>,
     hdb_dir: Option<Arc<PathBuf>>,
     pool: Arc<ConnPool>,
+    bars_enabled: bool,
 ) {
     for incoming in listener.incoming() {
         match incoming {
@@ -211,7 +232,7 @@ fn run_query_server(
                 let hdb_dir = hdb_dir.clone();
                 let pool = pool.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, stores, hdb_dir, pool) {
+                    if let Err(e) = handle_connection(stream, stores, hdb_dir, pool, bars_enabled) {
                         warn!(error = %e, "query connection failed");
                     }
                 });
@@ -229,12 +250,19 @@ fn handle_connection(
     stores: Arc<StoreSet>,
     hdb_dir: Option<Arc<PathBuf>>,
     pool: Arc<ConnPool>,
+    bars_enabled: bool,
 ) -> anyhow::Result<()> {
     let sql = query_proto::read_request(&mut stream)?;
     info!(sql_chars = sql.len(), "query received");
 
     let conn = pool.acquire();
-    let result = run_query(sql.as_str(), &stores, hdb_dir.as_ref().map(|p| p.as_path()), &conn);
+    let result = run_query(
+        sql.as_str(),
+        &stores,
+        hdb_dir.as_ref().map(|p| p.as_path()),
+        &conn,
+        bars_enabled,
+    );
     pool.release(conn);
 
     match result {
@@ -247,7 +275,13 @@ fn handle_connection(
     Ok(())
 }
 
-fn run_query(sql: &str, stores: &StoreSet, hdb_dir: Option<&Path>, conn: &Connection) -> anyhow::Result<Vec<u8>> {
+fn run_query(
+    sql: &str,
+    stores: &StoreSet,
+    hdb_dir: Option<&Path>,
+    conn: &Connection,
+    bars_enabled: bool,
+) -> anyhow::Result<Vec<u8>> {
     sql_guard::check(sql)?;
 
     let trades_rb = stores.snapshot_trades()?;
@@ -258,12 +292,17 @@ fn run_query(sql: &str, stores: &StoreSet, hdb_dir: Option<&Path>, conn: &Connec
     // `temp.` so this DROP is the inverse of the (re)creation that follows.
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.trades_live; DROP TABLE IF EXISTS temp.quotes_live;
+         DROP TABLE IF EXISTS temp.trades_bars;
          DROP VIEW  IF EXISTS temp.trades_hist; DROP VIEW  IF EXISTS temp.quotes_hist;
          DROP VIEW  IF EXISTS temp.trades;      DROP VIEW  IF EXISTS temp.quotes;",
     )?;
 
     create_arrow_table(conn, "trades_live", trades_rb)?;
     create_arrow_table(conn, "quotes_live", quotes_rb)?;
+    if bars_enabled {
+        let bars_rb = stores.snapshot_bars()?;
+        create_arrow_table(conn, "trades_bars", bars_rb)?;
+    }
     mount_hdb(conn, hdb_dir)?;
 
     let mut stmt = conn.prepare(sql)?;
@@ -351,6 +390,8 @@ fn replay_wal(
     stores: &StoreSet,
     row_cap: usize,
     since_secs: u64,
+    bar_interval_ns: u64,
+    bar_row_cap: usize,
 ) -> anyhow::Result<()> {
     let trade_path = wal_dir.join("trades.wal");
     let quote_path = wal_dir.join("quotes.wal");
@@ -378,7 +419,7 @@ fn replay_wal(
             }
             match stores.store_for(t.symbol_id) {
                 Some(store) => {
-                    store.trades.lock().push(t, row_cap);
+                    store.push_trade(t, row_cap, bar_interval_ns, bar_row_cap);
                     trade_replayed += 1;
                 }
                 None => trade_unknown_sym += 1,
@@ -429,6 +470,8 @@ fn run_ingest_loop(
     stores: Arc<StoreSet>,
     trade_lat: Arc<LatencyHistogram>,
     quote_lat: Arc<LatencyHistogram>,
+    bar_interval_ns: u64,
+    bar_row_cap: usize,
 ) -> anyhow::Result<()> {
     let row_cap = args.row_cap;
 
@@ -470,7 +513,7 @@ fn run_ingest_loop(
             let now = wall_ns();
             trade_lat.record(now.saturating_sub(trade.ts_local_ns));
             if let Some(store) = stores.store_for(trade.symbol_id) {
-                store.trades.lock().push(&trade, row_cap);
+                store.push_trade(&trade, row_cap, bar_interval_ns, bar_row_cap);
                 trade_count += 1;
             } else {
                 warn!(symbol_id = trade.symbol_id, "trade for unknown symbol_id");
