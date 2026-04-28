@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use arrow_array::{Float64Array, RecordBatch, StringArray, UInt64Array};
@@ -25,6 +26,11 @@ use tp_arrow::decode_ipc_stream;
 
 const REQ_OK: u8 = 0;
 const REQ_ERR: u8 = 1;
+
+// Both tests in this binary spawn `rdb serve`, which subscribes to the
+// shared iceoryx2 topics under /tmp/iceoryx2/ and is bounded by
+// MAX_SUBSCRIBERS. Serialize them so they don't fight for slots.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -144,6 +150,7 @@ impl Drop for ChildGuard {
 
 #[test]
 fn end_to_end_replay_and_asof() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     ensure_binaries_built();
 
     let scratch = ScratchDir::new("e2e");
@@ -154,6 +161,7 @@ fn end_to_end_replay_and_asof() {
 
     let wal_dir = scratch.path.join("wal");
     let socket  = scratch.path.join("rdb.sock");
+    let db      = scratch.path.join("rdb.duckdb");
 
     // iceoryx2 0.7 has no env-based config: shared-memory segments live
     // under /tmp/iceoryx2/. Clean it before the run to avoid picking up
@@ -164,6 +172,7 @@ fn end_to_end_replay_and_asof() {
     let mut rdb = rdb_cmd("serve");
     rdb.arg("--symbols").arg(&symbols)
        .arg("--socket").arg(&socket)
+       .arg("--db").arg(&db)
        .arg("--idle-exit-secs").arg("3")
        .env("RUST_LOG", "warn");
     let mut rdb = ChildGuard::new(rdb.spawn().expect("spawn rdb serve"));
@@ -252,4 +261,117 @@ fn end_to_end_replay_and_asof() {
 
     // Tear down rdb. Ingest will idle out after 3s; we can also kill it.
     rdb.kill();
+}
+
+// ---------------------------------------------------------------------------
+// User table CRUD against the persistent DuckDB catalog
+// ---------------------------------------------------------------------------
+
+/// Send SQL and return either OK batches or the server's error string. The
+/// existing `query` helper bails on REQ_ERR; the guard test needs the text.
+fn query_result(socket: &Path, sql: &str) -> std::result::Result<Vec<RecordBatch>, String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+    let bytes = sql.as_bytes();
+    stream.write_all(&(bytes.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(bytes).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    let mut s = [0u8; 1];
+    stream.read_exact(&mut s).map_err(|e| e.to_string())?;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+
+    match s[0] {
+        REQ_OK => decode_ipc_stream(&payload).map_err(|e| e.to_string()),
+        REQ_ERR => Err(String::from_utf8_lossy(&payload).into_owned()),
+        other => Err(format!("unknown status {other}")),
+    }
+}
+
+fn spawn_serve(symbols: &Path, socket: &Path, db: &Path) -> ChildGuard {
+    let mut cmd = rdb_cmd("serve");
+    cmd.arg("--symbols").arg(symbols)
+       .arg("--socket").arg(socket)
+       .arg("--db").arg(db)
+       // Long enough that the test finishes its work before idle-exit kicks
+       // in; ChildGuard kills explicitly on drop in any case.
+       .arg("--idle-exit-secs").arg("60")
+       .env("RUST_LOG", "warn");
+    let child = cmd.spawn().expect("spawn rdb serve");
+    let g = ChildGuard::new(child);
+    assert!(
+        wait_for_socket(socket, Duration::from_secs(5)),
+        "rdb socket did not appear at {}",
+        socket.display()
+    );
+    g
+}
+
+#[test]
+fn create_table_persists_and_guard_protects_streaming_views() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_binaries_built();
+
+    let scratch = ScratchDir::new("user-tables");
+    let symbols = workspace_root().join("config/symbols.toml");
+    assert!(symbols.exists(), "config/symbols.toml not found");
+
+    let socket = scratch.path.join("rdb.sock");
+    let db     = scratch.path.join("rdb.duckdb");
+
+    // --- Round 1: create + insert + read back ---
+    {
+        let mut rdb = spawn_serve(&symbols, &socket, &db);
+
+        query_result(&socket, "CREATE TABLE t (a INTEGER, b VARCHAR)")
+            .expect("CREATE TABLE should succeed");
+        query_result(&socket, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+            .expect("INSERT should succeed");
+
+        let batches = query_result(&socket, "SELECT a FROM t ORDER BY a").expect("SELECT");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "expected 2 rows in t, got {total}");
+
+        // Streaming view still works (no ingest, so count is 0).
+        let zero = query_result(&socket, "SELECT COUNT(*)::BIGINT FROM trades")
+            .expect("SELECT count(*) FROM trades");
+        let n = zero[0].column(0).as_any()
+            .downcast_ref::<arrow_array::Int64Array>().unwrap().value(0);
+        assert_eq!(n, 0, "trades stream should be empty in this test");
+
+        // Guard: DDL on a reserved name is rejected.
+        let err = query_result(&socket, "CREATE TABLE trades (x INT)").unwrap_err();
+        assert!(
+            err.contains("reserved") || err.contains("trades"),
+            "expected reserved-name error, got: {err}"
+        );
+
+        // Guard: dropping a reserved view is also rejected.
+        let err = query_result(&socket, "DROP TABLE quotes").unwrap_err();
+        assert!(
+            err.contains("reserved") || err.contains("quotes"),
+            "expected reserved-name error, got: {err}"
+        );
+
+        rdb.kill();
+    }
+
+    // Some time for the OS to release the socket file before reusing it.
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = std::fs::remove_file(&socket);
+
+    // --- Round 2: restart against the same --db, row should still be there ---
+    {
+        let mut rdb = spawn_serve(&symbols, &socket, &db);
+
+        let batches = query_result(&socket, "SELECT a, b FROM t ORDER BY a")
+            .expect("SELECT after restart should succeed and find table t");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "user table did not persist across restart");
+
+        rdb.kill();
+    }
 }

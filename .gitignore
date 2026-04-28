@@ -3,3 +3,6 @@
 /.vscode
 *.swp
 *~
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp/
