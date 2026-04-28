@@ -97,6 +97,12 @@ pub struct Args {
     /// Per-symbol row cap on the bars table. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     bar_row_cap: usize,
+
+    /// Log any query whose wall-clock duration meets or exceeds this many
+    /// milliseconds. 0 disables slow-query logging (the per-query
+    /// histogram still records). Default 250 ms.
+    #[arg(long, default_value_t = 250)]
+    slow_query_ms: u64,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -122,6 +128,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let trade_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
     let quote_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
+    let query_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
+    let slow_query_ms = args.slow_query_ms;
 
     let socket_path = args.socket.clone();
     if socket_path.exists() {
@@ -171,14 +179,21 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let stores_q = stores.clone();
     let hub_q = hub.clone();
+    let query_lat_q = query_lat.clone();
     let bars_enabled = bar_interval_ns > 0;
     let _query_thread = std::thread::Builder::new()
         .name("rdb-query".into())
         .spawn(move || {
-            run_query_server(listener, stores_q, hdb_dir, pool, bars_enabled, hub_q);
+            run_query_server(
+                listener, stores_q, hdb_dir, pool, bars_enabled, hub_q,
+                query_lat_q, slow_query_ms,
+            );
         })?;
 
-    run_ingest_loop(args, stores, trade_lat, quote_lat, bar_interval_ns, bar_row_cap, hub)
+    run_ingest_loop(
+        args, stores, trade_lat, quote_lat, query_lat,
+        bar_interval_ns, bar_row_cap, hub,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +291,8 @@ fn run_query_server(
     pool: Arc<ConnPool>,
     bars_enabled: bool,
     hub: Arc<SubscriberHub>,
+    query_lat: Arc<LatencyHistogram>,
+    slow_query_ms: u64,
 ) {
     for incoming in listener.incoming() {
         match incoming {
@@ -284,8 +301,12 @@ fn run_query_server(
                 let hdb_dir = hdb_dir.clone();
                 let pool = pool.clone();
                 let hub = hub.clone();
+                let query_lat = query_lat.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, stores, hdb_dir, pool, bars_enabled, hub) {
+                    if let Err(e) = handle_connection(
+                        stream, stores, hdb_dir, pool, bars_enabled, hub,
+                        query_lat, slow_query_ms,
+                    ) {
                         warn!(error = %e, "query connection failed");
                     }
                 });
@@ -305,6 +326,8 @@ fn handle_connection(
     pool: Arc<ConnPool>,
     bars_enabled: bool,
     hub: Arc<SubscriberHub>,
+    query_lat: Arc<LatencyHistogram>,
+    slow_query_ms: u64,
 ) -> anyhow::Result<()> {
     let sql = query_proto::read_request(&mut stream)?;
     info!(sql_chars = sql.len(), "query received");
@@ -313,6 +336,7 @@ fn handle_connection(
         return run_subscribe(stream, &sql, &stores, &hub);
     }
 
+    let started = Instant::now();
     let conn = pool.acquire();
     let result = run_query(
         sql.as_str(),
@@ -322,6 +346,13 @@ fn handle_connection(
         bars_enabled,
     );
     pool.release(conn);
+    let elapsed = started.elapsed();
+    query_lat.record(elapsed.as_nanos() as u64);
+    if slow_query_ms > 0 && elapsed.as_millis() as u64 >= slow_query_ms {
+        // Truncate the SQL preview to keep one log line bounded.
+        let preview: String = sql.chars().take(200).collect();
+        warn!(elapsed_ms = elapsed.as_millis() as u64, sql = %preview, "slow query");
+    }
 
     match result {
         Ok(payload) => query_proto::write_response(&mut stream, query_proto::STATUS_OK, &payload)?,
@@ -728,6 +759,7 @@ fn run_ingest_loop(
     stores: Arc<StoreSet>,
     trade_lat: Arc<LatencyHistogram>,
     quote_lat: Arc<LatencyHistogram>,
+    query_lat: Arc<LatencyHistogram>,
     bar_interval_ns: u64,
     bar_row_cap: usize,
     hub: Arc<SubscriberHub>,
@@ -815,10 +847,12 @@ fn run_ingest_loop(
         if now.saturating_sub(last_log_at) > log_period_ns {
             let t = trade_lat.snapshot();
             let q = quote_lat.snapshot();
+            let qry = query_lat.snapshot();
             info!(
                 trade_count, quote_count,
                 trade_p50_ns = ?t.p50, trade_p99_ns = ?t.p99, trade_samples = t.samples,
                 quote_p50_ns = ?q.p50, quote_p99_ns = ?q.p99, quote_samples = q.samples,
+                query_p50_ns = ?qry.p50, query_p99_ns = ?qry.p99, query_samples = qry.samples,
                 "rdb stats"
             );
             last_log_at = now;
@@ -827,10 +861,12 @@ fn run_ingest_loop(
 
     let t = trade_lat.snapshot();
     let q = quote_lat.snapshot();
+    let qry = query_lat.snapshot();
     info!(
         trade_count, quote_count,
         trade_p50_ns = ?t.p50, trade_p99_ns = ?t.p99,
         quote_p50_ns = ?q.p50, quote_p99_ns = ?q.p99,
+        query_p50_ns = ?qry.p50, query_p99_ns = ?qry.p99, query_samples = qry.samples,
         "rdb final stats"
     );
     Ok(())
