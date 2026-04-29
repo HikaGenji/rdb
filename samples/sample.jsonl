@@ -2,9 +2,11 @@
 {"kind":"trade","symbol":"BTC-PERP","ts_exchange_ns":1714000000010000000,"price":65000.4,"qty":0.5,"side":"buy"}
 {"kind":"quote","symbol":"ETH-PERP","ts_exchange_ns":1714000000020000000,"bid_price":3200.10,"bid_qty":4.0,"ask_price":3200.20,"ask_qty":4.0}
 {"kind":"trade","symbol":"ETH-PERP","ts_exchange_ns":1714000000030000000,"price":3200.15,"qty":2.0,"side":"sell"}
+{"kind":"book_l2","symbol":"BTC-PERP","ts_exchange_ns":1714000000035000000,"bids":[{"price":65001.0,"qty":1.5},{"price":65000.5,"qty":2.0},{"price":65000.0,"qty":3.0}],"asks":[{"price":65001.5,"qty":1.0},{"price":65002.0,"qty":2.5},{"price":65002.5,"qty":4.0}]}
 {"kind":"quote","symbol":"BTC-PERP","ts_exchange_ns":1714000000040000000,"bid_price":65001.0,"bid_qty":1.5,"ask_price":65001.5,"ask_qty":1.5}
 {"kind":"trade","symbol":"BTC-PERP","ts_exchange_ns":1714000000050000000,"price":65001.2,"qty":0.25,"side":"buy"}
 {"kind":"trade","symbol":"BTC-PERP","ts_exchange_ns":1714000000060000000,"price":65001.3,"qty":0.10,"side":"sell"}
+{"kind":"book_l2","symbol":"ETH-PERP","ts_exchange_ns":1714000000065000000,"bids":[{"price":3200.10,"qty":4.0},{"price":3200.05,"qty":6.0}],"asks":[{"price":3200.20,"qty":4.0},{"price":3200.25,"qty":5.0}]}
 {"kind":"quote","symbol":"SOL-PERP","ts_exchange_ns":1714000000070000000,"bid_price":150.123,"bid_qty":10.0,"ask_price":150.234,"ask_qty":10.0}
 {"kind":"trade","symbol":"SOL-PERP","ts_exchange_ns":1714000000080000000,"price":150.200,"qty":3.0,"side":"buy"}
 {"kind":"trade","symbol":"ETH-PERP","ts_exchange_ns":1714000000090000000,"price":3200.18,"qty":1.0,"side":"buy"}

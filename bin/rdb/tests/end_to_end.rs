@@ -296,6 +296,27 @@ fn end_to_end_replay_and_asof() {
         }
     }
 
+    // The L2 sample feed has two book_l2 rows (BTC-PERP, ETH-PERP). After
+    // replay, book_l2_live should carry both with non-zero best-bid/best-ask.
+    let l2 = query(
+        &socket,
+        "SELECT symbol, bid_price_0, ask_price_0 \
+         FROM book_l2_live ORDER BY symbol, ts_exchange_ns",
+    )
+    .unwrap();
+    let total_l2: usize = l2.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_l2, 2, "expected 2 L2 rows from sample feed, got {total_l2}");
+    for batch in &l2 {
+        let bids = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let asks = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        for i in 0..batch.num_rows() {
+            assert!(bids.value(i) > 0.0, "best bid must be > 0, row {i}");
+            assert!(asks.value(i) > bids.value(i),
+                    "ask must exceed bid: bid={} ask={} row {i}",
+                    bids.value(i), asks.value(i));
+        }
+    }
+
     // Tear down rdb. Ingest will idle out after 3s; we can also kill it.
     rdb.kill();
 }

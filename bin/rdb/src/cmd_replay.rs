@@ -15,7 +15,7 @@ use iceoryx2::prelude::*;
 use tracing::{info, warn};
 
 use tp_config::SymbolTable;
-use tp_types::{ipc_cfg, topics, wall_ns, FeedEvent, QuoteL1, Trade};
+use tp_types::{ipc_cfg, topics, wall_ns, BookL2, FeedEvent, QuoteL1, Trade, BOOK_L2_LEVELS};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Pace {
@@ -66,9 +66,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .max_publishers(ipc_cfg::MAX_PUBLISHERS)
         .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
         .open_or_create()?;
+    let book_l2_svc = node
+        .service_builder(&topics::BOOK_L2_RAW.try_into()?)
+        .publish_subscribe::<BookL2>()
+        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
+        .history_size(ipc_cfg::HISTORY_SIZE)
+        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
+        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
+        .open_or_create()?;
 
-    let trade_pub = trades_svc.publisher_builder().create()?;
-    let quote_pub = quotes_svc.publisher_builder().create()?;
+    let trade_pub   = trades_svc.publisher_builder().create()?;
+    let quote_pub   = quotes_svc.publisher_builder().create()?;
+    let book_l2_pub = book_l2_svc.publisher_builder().create()?;
 
     let file = File::open(&args.input)
         .with_context(|| format!("opening {}", args.input.display()))?;
@@ -93,8 +102,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         if let Pace::WallClock = args.pace {
             if let Some(prev) = last_ts_exchange {
                 let curr = match &evt {
-                    FeedEvent::Trade { ts_exchange_ns, .. } => *ts_exchange_ns,
-                    FeedEvent::Quote { ts_exchange_ns, .. } => *ts_exchange_ns,
+                    FeedEvent::Trade  { ts_exchange_ns, .. } => *ts_exchange_ns,
+                    FeedEvent::Quote  { ts_exchange_ns, .. } => *ts_exchange_ns,
+                    FeedEvent::BookL2 { ts_exchange_ns, .. } => *ts_exchange_ns,
                 };
                 if curr > prev {
                     std::thread::sleep(Duration::from_nanos(curr - prev));
@@ -142,6 +152,35 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     ask_qty:   symbols.encode_qty(symbol_id, ask_qty),
                 };
                 let sample = quote_pub.loan_uninit()?.write_payload(quote);
+                sample.send()?;
+                last_ts_exchange = Some(ts_exchange_ns);
+            }
+            FeedEvent::BookL2 { symbol, ts_exchange_ns, bids, asks } => {
+                let Some(symbol_id) = symbols.id_of(&symbol) else {
+                    warn!(symbol, "unknown symbol in feed; dropping");
+                    skipped += 1;
+                    continue;
+                };
+                let mut book = BookL2 {
+                    seq: 0,
+                    ts_exchange_ns,
+                    ts_local_ns: wall_ns(),
+                    symbol_id,
+                    _pad: 0,
+                    bid_prices: [0i64; BOOK_L2_LEVELS],
+                    bid_qtys:   [0i64; BOOK_L2_LEVELS],
+                    ask_prices: [0i64; BOOK_L2_LEVELS],
+                    ask_qtys:   [0i64; BOOK_L2_LEVELS],
+                };
+                for (lvl, l) in bids.iter().take(BOOK_L2_LEVELS).enumerate() {
+                    book.bid_prices[lvl] = symbols.encode_price(symbol_id, l.price);
+                    book.bid_qtys[lvl]   = symbols.encode_qty(symbol_id, l.qty);
+                }
+                for (lvl, l) in asks.iter().take(BOOK_L2_LEVELS).enumerate() {
+                    book.ask_prices[lvl] = symbols.encode_price(symbol_id, l.price);
+                    book.ask_qtys[lvl]   = symbols.encode_qty(symbol_id, l.qty);
+                }
+                let sample = book_l2_pub.loan_uninit()?.write_payload(book);
                 sample.send()?;
                 last_ts_exchange = Some(ts_exchange_ns);
             }

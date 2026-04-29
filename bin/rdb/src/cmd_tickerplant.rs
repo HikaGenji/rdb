@@ -12,7 +12,7 @@ use iceoryx2::prelude::*;
 use tracing::info;
 
 use tp_config::SymbolTable;
-use tp_types::{ipc_cfg, metrics::LatencyHistogram, topics, wall_ns, QuoteL1, Trade};
+use tp_types::{ipc_cfg, metrics::LatencyHistogram, topics, wall_ns, BookL2, QuoteL1, Trade};
 use tp_wal::WalWriter;
 
 #[derive(clap::Args, Debug)]
@@ -59,15 +59,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     info!(symbol_count = symbols.len(), "loaded symbols");
 
     std::fs::create_dir_all(&args.wal_dir)?;
-    let trade_wal_path = args.wal_dir.join("trades.wal");
-    let quote_wal_path = args.wal_dir.join("quotes.wal");
-    let mut trade_wal: WalWriter<Trade> = WalWriter::open_or_create(&trade_wal_path)?;
-    let mut quote_wal: WalWriter<QuoteL1> = WalWriter::open_or_create(&quote_wal_path)?;
+    let trade_wal_path   = args.wal_dir.join("trades.wal");
+    let quote_wal_path   = args.wal_dir.join("quotes.wal");
+    let book_l2_wal_path = args.wal_dir.join("book_l2.wal");
+    let mut trade_wal:   WalWriter<Trade>   = WalWriter::open_or_create(&trade_wal_path)?;
+    let mut quote_wal:   WalWriter<QuoteL1> = WalWriter::open_or_create(&quote_wal_path)?;
+    let mut book_l2_wal: WalWriter<BookL2>  = WalWriter::open_or_create(&book_l2_wal_path)?;
     info!(
-        trade_wal = %trade_wal_path.display(),
-        quote_wal = %quote_wal_path.display(),
-        trade_wal_count = trade_wal.count(),
-        quote_wal_count = quote_wal.count(),
+        trade_wal   = %trade_wal_path.display(),
+        quote_wal   = %quote_wal_path.display(),
+        book_l2_wal = %book_l2_wal_path.display(),
+        trade_wal_count   = trade_wal.count(),
+        quote_wal_count   = quote_wal.count(),
+        book_l2_wal_count = book_l2_wal.count(),
         "WAL files opened"
     );
 
@@ -83,6 +87,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let quotes_in = node
         .service_builder(&topics::QUOTES_RAW.try_into()?)
         .publish_subscribe::<QuoteL1>()
+        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
+        .history_size(ipc_cfg::HISTORY_SIZE)
+        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
+        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
+        .open_or_create()?;
+    let book_l2_in = node
+        .service_builder(&topics::BOOK_L2_RAW.try_into()?)
+        .publish_subscribe::<BookL2>()
         .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
         .history_size(ipc_cfg::HISTORY_SIZE)
         .max_publishers(ipc_cfg::MAX_PUBLISHERS)
@@ -104,19 +116,31 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .max_publishers(ipc_cfg::MAX_PUBLISHERS)
         .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
         .open_or_create()?;
+    let book_l2_out = node
+        .service_builder(&topics::BOOK_L2_AGG.try_into()?)
+        .publish_subscribe::<BookL2>()
+        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
+        .history_size(ipc_cfg::HISTORY_SIZE)
+        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
+        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
+        .open_or_create()?;
 
-    let trade_sub = trades_in.subscriber_builder().create()?;
-    let quote_sub = quotes_in.subscriber_builder().create()?;
-    let trade_pub = trades_out.publisher_builder().create()?;
-    let quote_pub = quotes_out.publisher_builder().create()?;
+    let trade_sub   = trades_in.subscriber_builder().create()?;
+    let quote_sub   = quotes_in.subscriber_builder().create()?;
+    let book_l2_sub = book_l2_in.subscriber_builder().create()?;
+    let trade_pub   = trades_out.publisher_builder().create()?;
+    let quote_pub   = quotes_out.publisher_builder().create()?;
+    let book_l2_pub = book_l2_out.publisher_builder().create()?;
 
-    let trade_lat = LatencyHistogram::new(args.hist_capacity);
-    let quote_lat = LatencyHistogram::new(args.hist_capacity);
+    let trade_lat   = LatencyHistogram::new(args.hist_capacity);
+    let quote_lat   = LatencyHistogram::new(args.hist_capacity);
+    let book_l2_lat = LatencyHistogram::new(args.hist_capacity);
 
     // Resume per-stream sequence numbers from the WAL count so a restart
     // does not produce overlapping seq values.
-    let mut trade_seq: u64 = trade_wal.count();
-    let mut quote_seq: u64 = quote_wal.count();
+    let mut trade_seq:   u64 = trade_wal.count();
+    let mut quote_seq:   u64 = quote_wal.count();
+    let mut book_l2_seq: u64 = book_l2_wal.count();
     let mut last_msg_at = wall_ns();
     let mut last_log_at = wall_ns();
     let mut last_fsync_at = wall_ns();
@@ -156,6 +180,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             did_work = true;
         }
 
+        while let Some(sample) = book_l2_sub.receive()? {
+            let mut b = *sample;
+            let now = wall_ns();
+            book_l2_lat.record(now.saturating_sub(b.ts_local_ns));
+            book_l2_seq += 1;
+            b.seq = book_l2_seq;
+            book_l2_wal.append(&b)?;
+            unflushed_appends += 1;
+            let s = book_l2_pub.loan_uninit()?.write_payload(b);
+            s.send()?;
+            did_work = true;
+        }
+
         let now = wall_ns();
         let due_by_count = args.wal_fsync_batch > 0 && unflushed_appends >= args.wal_fsync_batch;
         let due_by_timer = fsync_interval_ns > 0
@@ -164,6 +201,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         if due_by_count || due_by_timer {
             trade_wal.sync()?;
             quote_wal.sync()?;
+            book_l2_wal.sync()?;
             unflushed_appends = 0;
             last_fsync_at = now;
         }
@@ -177,18 +215,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             std::thread::sleep(idle_sleep);
         }
 
-        if args.limit != 0 && trade_seq + quote_seq >= args.limit {
-            info!(trade_seq, quote_seq, "limit reached; exiting");
+        if args.limit != 0 && trade_seq + quote_seq + book_l2_seq >= args.limit {
+            info!(trade_seq, quote_seq, book_l2_seq, "limit reached; exiting");
             break;
         }
 
         if now.saturating_sub(last_log_at) > log_period_ns {
             let t = trade_lat.snapshot();
             let q = quote_lat.snapshot();
+            let b = book_l2_lat.snapshot();
             info!(
-                trade_seq, quote_seq,
-                trade_p50_ns = ?t.p50, trade_p99_ns = ?t.p99, trade_samples = t.samples,
-                quote_p50_ns = ?q.p50, quote_p99_ns = ?q.p99, quote_samples = q.samples,
+                trade_seq, quote_seq, book_l2_seq,
+                trade_p50_ns   = ?t.p50, trade_p99_ns   = ?t.p99, trade_samples   = t.samples,
+                quote_p50_ns   = ?q.p50, quote_p99_ns   = ?q.p99, quote_samples   = q.samples,
+                book_l2_p50_ns = ?b.p50, book_l2_p99_ns = ?b.p99, book_l2_samples = b.samples,
                 "tickerplant stats"
             );
             last_log_at = now;
@@ -198,18 +238,21 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if unflushed_appends > 0 {
         trade_wal.sync()?;
         quote_wal.sync()?;
+        book_l2_wal.sync()?;
     }
 
-    info!(trade_seq, quote_seq, "tickerplant finalising WALs");
+    info!(trade_seq, quote_seq, book_l2_seq, "tickerplant finalising WALs");
     trade_wal.flush()?;
     quote_wal.flush()?;
+    book_l2_wal.flush()?;
     trade_wal.finalize()?;
     quote_wal.finalize()?;
+    book_l2_wal.finalize()?;
 
     let t = trade_lat.snapshot();
     let q = quote_lat.snapshot();
     info!(
-        trade_count = trade_seq, quote_count = quote_seq,
+        trade_count = trade_seq, quote_count = quote_seq, book_l2_count = book_l2_seq,
         trade_p50_ns = ?t.p50, trade_p99_ns = ?t.p99,
         quote_p50_ns = ?q.p50, quote_p99_ns = ?q.p99,
         "tickerplant final stats"

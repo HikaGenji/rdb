@@ -20,8 +20,10 @@ pub mod topics {
     //! Canonical iceoryx2 service names used across the prototype.
     pub const TRADES_RAW: &str = "rdb/trades/raw";
     pub const QUOTES_RAW: &str = "rdb/quotes/raw";
+    pub const BOOK_L2_RAW: &str = "rdb/book_l2/raw";
     pub const TRADES_AGG: &str = "rdb/trades/agg";
     pub const QUOTES_AGG: &str = "rdb/quotes/agg";
+    pub const BOOK_L2_AGG: &str = "rdb/book_l2/agg";
 }
 
 /// Side of a trade. Wire value matches [`Trade::side`].
@@ -85,6 +87,44 @@ unsafe impl ZeroCopySend for QuoteL1 {
     }
 }
 
+/// Number of price levels carried per side in [`BookL2`]. Fixed at compile
+/// time so the wire record stays a `repr(C)` POD with deterministic size.
+/// Bumping this is a breaking wire change; bump `type_name` accordingly.
+pub const BOOK_L2_LEVELS: usize = 5;
+
+/// L2 order-book snapshot for a single symbol, top-of-book + 4 deeper
+/// levels per side. 192 bytes when `BOOK_L2_LEVELS = 5`.
+///
+/// Levels are ordered from best to worst: index 0 = best bid / best ask.
+/// Unused trailing levels carry `price = 0` and `qty = 0` (a publisher
+/// with shallower depth zero-pads the tail).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BookL2 {
+    pub seq: u64,
+    pub ts_exchange_ns: u64,
+    pub ts_local_ns: u64,
+    pub symbol_id: u32,
+    pub _pad: u32,
+    pub bid_prices: [i64; BOOK_L2_LEVELS],
+    pub bid_qtys:   [i64; BOOK_L2_LEVELS],
+    pub ask_prices: [i64; BOOK_L2_LEVELS],
+    pub ask_qtys:   [i64; BOOK_L2_LEVELS],
+}
+
+unsafe impl ZeroCopySend for BookL2 {
+    unsafe fn type_name() -> &'static str {
+        "rdb::BookL2::v1"
+    }
+}
+
+/// Decoded L2 level inside a [`FeedEvent::BookL2`] JSONL row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2Level {
+    pub price: f64,
+    pub qty: f64,
+}
+
 /// Returns wall-clock nanos since the unix epoch.
 ///
 /// Wall clock is sufficient on a single host because all processes run against
@@ -118,5 +158,14 @@ pub enum FeedEvent {
         bid_qty: f64,
         ask_price: f64,
         ask_qty: f64,
+    },
+    BookL2 {
+        symbol: String,
+        ts_exchange_ns: u64,
+        /// Up to [`BOOK_L2_LEVELS`] bid levels, best-first. Excess is dropped
+        /// by the replayer; shorter rows are zero-padded.
+        bids: Vec<L2Level>,
+        /// Up to [`BOOK_L2_LEVELS`] ask levels, best-first.
+        asks: Vec<L2Level>,
     },
 }

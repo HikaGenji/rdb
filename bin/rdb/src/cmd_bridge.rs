@@ -11,7 +11,7 @@ use iceoryx2::prelude::*;
 use tracing::{info, warn};
 use zenoh::sample::Sample;
 
-use tp_types::{ipc_cfg, topics, QuoteL1, Trade};
+use tp_types::{ipc_cfg, topics, BookL2, QuoteL1, Trade};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Mode {
@@ -70,9 +70,18 @@ fn run_outbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> 
         .max_publishers(ipc_cfg::MAX_PUBLISHERS)
         .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
         .open_or_create()?;
+    let book_l2_svc = node
+        .service_builder(&topics::BOOK_L2_AGG.try_into()?)
+        .publish_subscribe::<BookL2>()
+        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
+        .history_size(ipc_cfg::HISTORY_SIZE)
+        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
+        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
+        .open_or_create()?;
 
-    let trade_iox_sub = trades_svc.subscriber_builder().create()?;
-    let quote_iox_sub = quotes_svc.subscriber_builder().create()?;
+    let trade_iox_sub   = trades_svc.subscriber_builder().create()?;
+    let quote_iox_sub   = quotes_svc.subscriber_builder().create()?;
+    let book_l2_iox_sub = book_l2_svc.subscriber_builder().create()?;
 
     let zconfig = build_zenoh_config(&args.zenoh_config)?;
     let session = rt
@@ -84,6 +93,9 @@ fn run_outbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> 
     let quote_zen_pub = rt
         .block_on(async { session.declare_publisher(topics::QUOTES_AGG).await })
         .map_err(|e| anyhow::anyhow!("declaring zenoh quotes publisher: {e}"))?;
+    let book_l2_zen_pub = rt
+        .block_on(async { session.declare_publisher(topics::BOOK_L2_AGG).await })
+        .map_err(|e| anyhow::anyhow!("declaring zenoh book_l2 publisher: {e}"))?;
 
     info!("zenoh-bridge outbound: forwarding iceoryx2 agg → zenoh");
 
@@ -102,6 +114,13 @@ fn run_outbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> 
             let quote: QuoteL1 = *sample;
             let bytes: Vec<u8> = bytes_of(&quote).to_vec();
             rt.block_on(async { quote_zen_pub.put(bytes).await })
+                .map_err(ze)?;
+            did_work = true;
+        }
+        while let Some(sample) = book_l2_iox_sub.receive()? {
+            let book: BookL2 = *sample;
+            let bytes: Vec<u8> = bytes_of(&book).to_vec();
+            rt.block_on(async { book_l2_zen_pub.put(bytes).await })
                 .map_err(ze)?;
             did_work = true;
         }
@@ -131,9 +150,18 @@ fn run_inbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         .max_publishers(ipc_cfg::MAX_PUBLISHERS)
         .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
         .open_or_create()?;
+    let book_l2_svc = node
+        .service_builder(&topics::BOOK_L2_AGG.try_into()?)
+        .publish_subscribe::<BookL2>()
+        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
+        .history_size(ipc_cfg::HISTORY_SIZE)
+        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
+        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
+        .open_or_create()?;
 
-    let iox_trade_pub = trades_svc.publisher_builder().create()?;
-    let iox_quote_pub = quotes_svc.publisher_builder().create()?;
+    let iox_trade_pub   = trades_svc.publisher_builder().create()?;
+    let iox_quote_pub   = quotes_svc.publisher_builder().create()?;
+    let iox_book_l2_pub = book_l2_svc.publisher_builder().create()?;
 
     let zconfig = build_zenoh_config(&args.zenoh_config)?;
     let session = rt
@@ -143,6 +171,8 @@ fn run_inbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     let (trade_bytes_tx, trade_bytes_rx) =
         crossbeam_channel::bounded::<Vec<u8>>(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE);
     let (quote_bytes_tx, quote_bytes_rx) =
+        crossbeam_channel::bounded::<Vec<u8>>(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE);
+    let (book_l2_bytes_tx, book_l2_bytes_rx) =
         crossbeam_channel::bounded::<Vec<u8>>(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE);
 
     let _trade_zen_sub = rt
@@ -183,20 +213,61 @@ fn run_inbound(args: Args, rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("declaring zenoh quotes subscriber: {e}"))?;
 
-    info!("zenoh-bridge inbound: forwarding zenoh → iceoryx2 agg");
+    let _book_l2_zen_sub = rt
+        .block_on(async {
+            session
+                .declare_subscriber(topics::BOOK_L2_AGG)
+                .callback({
+                    let tx = book_l2_bytes_tx;
+                    move |sample: Sample| {
+                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                        if bytes.len() == size_of::<BookL2>() {
+                            let _ = tx.try_send(bytes);
+                        } else {
+                            warn!(len = bytes.len(), "book_l2: unexpected payload size, dropping");
+                        }
+                    }
+                })
+                .await
+        })
+        .map_err(|e| anyhow::anyhow!("declaring zenoh book_l2 subscriber: {e}"))?;
+
+    info!("zenoh-bridge inbound: forwarding zenoh → iceoryx2 agg (with seq remap)");
+
+    // Per-stream local sequence counters. Inbound records carry the upstream
+    // host's seq, which has no monotonicity guarantee at the destination
+    // (multiple hosts could publish overlapping ranges, and a remote
+    // tickerplant restart resets to 0). Remapping to a local counter gives
+    // downstream consumers a clean monotonic stream they can use for
+    // gap-detection. The original upstream seq is intentionally discarded;
+    // a future revision could carry it in a side-channel for audit.
+    let mut local_trade_seq:   u64 = 0;
+    let mut local_quote_seq:   u64 = 0;
+    let mut local_book_l2_seq: u64 = 0;
 
     let idle = Duration::from_micros(args.idle_sleep_us);
     loop {
         let mut did_work = false;
 
         while let Ok(bytes) = trade_bytes_rx.try_recv() {
-            let trade: Trade = pod_read_unaligned(&bytes);
+            let mut trade: Trade = pod_read_unaligned(&bytes);
+            local_trade_seq += 1;
+            trade.seq = local_trade_seq;
             iox_trade_pub.loan_uninit()?.write_payload(trade).send()?;
             did_work = true;
         }
         while let Ok(bytes) = quote_bytes_rx.try_recv() {
-            let quote: QuoteL1 = pod_read_unaligned(&bytes);
+            let mut quote: QuoteL1 = pod_read_unaligned(&bytes);
+            local_quote_seq += 1;
+            quote.seq = local_quote_seq;
             iox_quote_pub.loan_uninit()?.write_payload(quote).send()?;
+            did_work = true;
+        }
+        while let Ok(bytes) = book_l2_bytes_rx.try_recv() {
+            let mut book: BookL2 = pod_read_unaligned(&bytes);
+            local_book_l2_seq += 1;
+            book.seq = local_book_l2_seq;
+            iox_book_l2_pub.loan_uninit()?.write_payload(book).send()?;
             did_work = true;
         }
 

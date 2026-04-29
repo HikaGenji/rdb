@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use tp_arrow::{encode_ipc_stream, StoreSet};
 use tp_config::SymbolTable;
 use tp_types::{
-    ipc_cfg, metrics::LatencyHistogram, query_proto, topics, wall_ns, QuoteL1, Side, Trade,
+    ipc_cfg, metrics::LatencyHistogram, query_proto, topics, wall_ns, BookL2, QuoteL1, Side, Trade,
 };
 use tp_wal as wal;
 
@@ -126,9 +126,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .with_context(|| format!("replaying WAL from {}", wal_dir.display()))?;
     }
 
-    let trade_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
-    let quote_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
-    let query_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
+    let trade_lat   = Arc::new(LatencyHistogram::new(args.hist_capacity));
+    let quote_lat   = Arc::new(LatencyHistogram::new(args.hist_capacity));
+    let book_l2_lat = Arc::new(LatencyHistogram::new(args.hist_capacity));
+    let query_lat   = Arc::new(LatencyHistogram::new(args.hist_capacity));
     let slow_query_ms = args.slow_query_ms;
 
     let socket_path = args.socket.clone();
@@ -191,7 +192,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         })?;
 
     run_ingest_loop(
-        args, stores, trade_lat, quote_lat, query_lat,
+        args, stores, trade_lat, quote_lat, book_l2_lat, query_lat,
         bar_interval_ns, bar_row_cap, hub,
     )
 }
@@ -208,8 +209,9 @@ const SUBSCRIBER_QUEUE_CAP: usize = 16_384;
 
 #[derive(Default)]
 struct SubscriberHub {
-    trades: parking_lot::Mutex<Vec<chan::Sender<Trade>>>,
-    quotes: parking_lot::Mutex<Vec<chan::Sender<QuoteL1>>>,
+    trades:  parking_lot::Mutex<Vec<chan::Sender<Trade>>>,
+    quotes:  parking_lot::Mutex<Vec<chan::Sender<QuoteL1>>>,
+    book_l2: parking_lot::Mutex<Vec<chan::Sender<BookL2>>>,
 }
 
 impl SubscriberHub {
@@ -225,6 +227,12 @@ impl SubscriberHub {
         rx
     }
 
+    fn subscribe_book_l2(&self) -> chan::Receiver<BookL2> {
+        let (tx, rx) = chan::bounded(SUBSCRIBER_QUEUE_CAP);
+        self.book_l2.lock().push(tx);
+        rx
+    }
+
     fn broadcast_trade(&self, t: &Trade) {
         let mut subs = self.trades.lock();
         subs.retain(|tx| match tx.try_send(*t) {
@@ -237,6 +245,15 @@ impl SubscriberHub {
     fn broadcast_quote(&self, q: &QuoteL1) {
         let mut subs = self.quotes.lock();
         subs.retain(|tx| match tx.try_send(*q) {
+            Ok(()) => true,
+            Err(chan::TrySendError::Full(_)) => true,
+            Err(chan::TrySendError::Disconnected(_)) => false,
+        });
+    }
+
+    fn broadcast_book_l2(&self, b: &BookL2) {
+        let mut subs = self.book_l2.lock();
+        subs.retain(|tx| match tx.try_send(*b) {
             Ok(()) => true,
             Err(chan::TrySendError::Full(_)) => true,
             Err(chan::TrySendError::Disconnected(_)) => false,
@@ -373,21 +390,24 @@ fn run_query(
 ) -> anyhow::Result<Vec<u8>> {
     sql_guard::check(sql)?;
 
-    let trades_rb = stores.snapshot_trades()?;
-    let quotes_rb = stores.snapshot_quotes()?;
+    let trades_rb  = stores.snapshot_trades()?;
+    let quotes_rb  = stores.snapshot_quotes()?;
+    let book_l2_rb = stores.snapshot_book_l2()?;
 
     // Reset only the temp namespace — user catalog objects in the persistent
     // database are untouched. Every streaming fixture below is created in
     // `temp.` so this DROP is the inverse of the (re)creation that follows.
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.trades_live; DROP TABLE IF EXISTS temp.quotes_live;
+         DROP TABLE IF EXISTS temp.book_l2_live;
          DROP TABLE IF EXISTS temp.trades_bars;
          DROP VIEW  IF EXISTS temp.trades_hist; DROP VIEW  IF EXISTS temp.quotes_hist;
          DROP VIEW  IF EXISTS temp.trades;      DROP VIEW  IF EXISTS temp.quotes;",
     )?;
 
-    create_arrow_table(conn, "trades_live", trades_rb)?;
-    create_arrow_table(conn, "quotes_live", quotes_rb)?;
+    create_arrow_table(conn, "trades_live",  trades_rb)?;
+    create_arrow_table(conn, "quotes_live",  quotes_rb)?;
+    create_arrow_table(conn, "book_l2_live", book_l2_rb)?;
     if bars_enabled {
         let bars_rb = stores.snapshot_bars()?;
         create_arrow_table(conn, "trades_bars", bars_rb)?;
@@ -426,10 +446,13 @@ fn run_subscribe(
         return Ok(());
     }
     match topic.as_str() {
-        "trades" => stream_trades(&mut stream, stores, hub),
-        "quotes" => stream_quotes(&mut stream, stores, hub),
+        "trades"   => stream_trades(&mut stream, stores, hub),
+        "quotes"   => stream_quotes(&mut stream, stores, hub),
+        "book_l2"  => stream_book_l2(&mut stream, stores, hub),
         other => {
-            let msg = format!("subscribe: unknown topic '{other}' (try trades, quotes)");
+            let msg = format!(
+                "subscribe: unknown topic '{other}' (try trades, quotes, book_l2)"
+            );
             let _ = query_proto::write_response(
                 &mut stream, query_proto::STATUS_ERR, msg.as_bytes(),
             );
@@ -564,6 +587,88 @@ fn trades_to_batch(rows: &[Trade], stores: &StoreSet) -> anyhow::Result<RecordBa
     Ok(RecordBatch::try_new(stores.trades_schema.clone(), arrays)?)
 }
 
+fn stream_book_l2(
+    stream: &mut UnixStream,
+    stores: &StoreSet,
+    hub: &SubscriberHub,
+) -> anyhow::Result<()> {
+    let rx = hub.subscribe_book_l2();
+    let mut buf: Vec<BookL2> = Vec::with_capacity(STREAM_FLUSH_ROWS);
+    let mut last_flush = Instant::now();
+    let timeout = Duration::from_millis(STREAM_FLUSH_MS);
+    loop {
+        match rx.recv_timeout(timeout) {
+            Ok(b) => buf.push(b),
+            Err(chan::RecvTimeoutError::Timeout) => {}
+            Err(chan::RecvTimeoutError::Disconnected) => break,
+        }
+        while buf.len() < STREAM_FLUSH_ROWS {
+            match rx.try_recv() {
+                Ok(b) => buf.push(b),
+                Err(_) => break,
+            }
+        }
+        let due = !buf.is_empty()
+            && (buf.len() >= STREAM_FLUSH_ROWS || last_flush.elapsed() >= timeout);
+        if due {
+            let rb = book_l2_to_batch(&buf, stores)?;
+            let payload = encode_ipc_stream(&[rb], &stores.book_l2_schema)?;
+            if query_proto::write_response(&mut *stream, query_proto::STATUS_BATCH, &payload).is_err() {
+                break;
+            }
+            buf.clear();
+            last_flush = Instant::now();
+        }
+    }
+    Ok(())
+}
+
+fn book_l2_to_batch(rows: &[BookL2], stores: &StoreSet) -> anyhow::Result<RecordBatch> {
+    use tp_types::BOOK_L2_LEVELS;
+    let mut symbol = Vec::with_capacity(rows.len());
+    let mut symbol_id = Vec::with_capacity(rows.len());
+    let mut seq = Vec::with_capacity(rows.len());
+    let mut ts_exchange_ns = Vec::with_capacity(rows.len());
+    let mut ts_local_ns = Vec::with_capacity(rows.len());
+    let mut bid_prices: Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+    let mut bid_qtys:   Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+    let mut ask_prices: Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+    let mut ask_qtys:   Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+
+    for b in rows {
+        let store = match stores.store_for(b.symbol_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        symbol.push(store.symbol.clone());
+        symbol_id.push(b.symbol_id);
+        seq.push(b.seq);
+        ts_exchange_ns.push(b.ts_exchange_ns);
+        ts_local_ns.push(b.ts_local_ns);
+        for lvl in 0..BOOK_L2_LEVELS {
+            bid_prices[lvl].push(decode_fixed_local(b.bid_prices[lvl], store.price_scale));
+            bid_qtys[lvl].push(decode_fixed_local(b.bid_qtys[lvl],     store.qty_scale));
+            ask_prices[lvl].push(decode_fixed_local(b.ask_prices[lvl], store.price_scale));
+            ask_qtys[lvl].push(decode_fixed_local(b.ask_qtys[lvl],     store.qty_scale));
+        }
+    }
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(5 + 4 * BOOK_L2_LEVELS);
+    arrays.push(Arc::new(StringArray::from(symbol)));
+    arrays.push(Arc::new(UInt32Array::from(symbol_id)));
+    arrays.push(Arc::new(UInt64Array::from(seq)));
+    arrays.push(Arc::new(UInt64Array::from(ts_exchange_ns)));
+    arrays.push(Arc::new(UInt64Array::from(ts_local_ns)));
+    for lvl in 0..BOOK_L2_LEVELS {
+        arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut bid_prices[lvl]))));
+        arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut bid_qtys[lvl]))));
+    }
+    for lvl in 0..BOOK_L2_LEVELS {
+        arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut ask_prices[lvl]))));
+        arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut ask_qtys[lvl]))));
+    }
+    Ok(RecordBatch::try_new(stores.book_l2_schema.clone(), arrays)?)
+}
+
 fn quotes_to_batch(rows: &[QuoteL1], stores: &StoreSet) -> anyhow::Result<RecordBatch> {
     let mut symbol = Vec::with_capacity(rows.len());
     let mut symbol_id = Vec::with_capacity(rows.len());
@@ -682,9 +787,10 @@ fn replay_wal(
     bar_interval_ns: u64,
     bar_row_cap: usize,
 ) -> anyhow::Result<()> {
-    let trade_path = wal_dir.join("trades.wal");
-    let quote_path = wal_dir.join("quotes.wal");
-    if !trade_path.exists() && !quote_path.exists() {
+    let trade_path   = wal_dir.join("trades.wal");
+    let quote_path   = wal_dir.join("quotes.wal");
+    let book_l2_path = wal_dir.join("book_l2.wal");
+    if !trade_path.exists() && !quote_path.exists() && !book_l2_path.exists() {
         info!(wal_dir = %wal_dir.display(), "no WAL files to replay");
         return Ok(());
     }
@@ -737,6 +843,27 @@ fn replay_wal(
         }
     }
 
+    let mut book_l2_replayed = 0u64;
+    let mut book_l2_skipped_old = 0u64;
+    let mut book_l2_unknown_sym = 0u64;
+    if book_l2_path.exists() {
+        let books = wal::read_all::<BookL2>(&book_l2_path)
+            .with_context(|| format!("reading {}", book_l2_path.display()))?;
+        for b in &books {
+            if cutoff_ns > 0 && b.ts_local_ns < cutoff_ns {
+                book_l2_skipped_old += 1;
+                continue;
+            }
+            match stores.store_for(b.symbol_id) {
+                Some(store) => {
+                    store.book_l2.lock().push(b, row_cap);
+                    book_l2_replayed += 1;
+                }
+                None => book_l2_unknown_sym += 1,
+            }
+        }
+    }
+
     info!(
         wal_dir = %wal_dir.display(),
         trade_replayed,
@@ -745,6 +872,9 @@ fn replay_wal(
         quote_replayed,
         quote_skipped_old,
         quote_unknown_sym,
+        book_l2_replayed,
+        book_l2_skipped_old,
+        book_l2_unknown_sym,
         "WAL replay complete"
     );
     Ok(())
@@ -759,6 +889,7 @@ fn run_ingest_loop(
     stores: Arc<StoreSet>,
     trade_lat: Arc<LatencyHistogram>,
     quote_lat: Arc<LatencyHistogram>,
+    book_l2_lat: Arc<LatencyHistogram>,
     query_lat: Arc<LatencyHistogram>,
     bar_interval_ns: u64,
     bar_row_cap: usize,
@@ -783,9 +914,18 @@ fn run_ingest_loop(
         .max_publishers(ipc_cfg::MAX_PUBLISHERS)
         .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
         .open_or_create()?;
+    let book_l2_svc = node
+        .service_builder(&topics::BOOK_L2_AGG.try_into()?)
+        .publish_subscribe::<BookL2>()
+        .subscriber_max_buffer_size(ipc_cfg::SUBSCRIBER_MAX_BUFFER_SIZE)
+        .history_size(ipc_cfg::HISTORY_SIZE)
+        .max_publishers(ipc_cfg::MAX_PUBLISHERS)
+        .max_subscribers(ipc_cfg::MAX_SUBSCRIBERS)
+        .open_or_create()?;
 
-    let trade_sub = trades_svc.subscriber_builder().create()?;
-    let quote_sub = quotes_svc.subscriber_builder().create()?;
+    let trade_sub   = trades_svc.subscriber_builder().create()?;
+    let quote_sub   = quotes_svc.subscriber_builder().create()?;
+    let book_l2_sub = book_l2_svc.subscriber_builder().create()?;
 
     let mut last_msg_at = wall_ns();
     let mut last_log_at = wall_ns();
@@ -793,8 +933,9 @@ fn run_ingest_loop(
     let idle_sleep = Duration::from_micros(args.idle_sleep_us);
     let idle_exit_ns = args.idle_exit_secs.saturating_mul(1_000_000_000);
 
-    let mut trade_count: u64 = 0;
-    let mut quote_count: u64 = 0;
+    let mut trade_count:   u64 = 0;
+    let mut quote_count:   u64 = 0;
+    let mut book_l2_count: u64 = 0;
 
     loop {
         let mut did_work = false;
@@ -829,6 +970,21 @@ fn run_ingest_loop(
             did_work = true;
         }
 
+        while let Some(sample) = book_l2_sub.receive()? {
+            let b = *sample;
+            let now = wall_ns();
+            book_l2_lat.record(now.saturating_sub(b.ts_local_ns));
+            if let Some(store) = stores.store_for(b.symbol_id) {
+                store.book_l2.lock().push(&b, row_cap);
+                book_l2_count += 1;
+                hub.broadcast_book_l2(&b);
+            } else {
+                warn!(symbol_id = b.symbol_id, "book_l2 for unknown symbol_id");
+                book_l2_lat.record_drop();
+            }
+            did_work = true;
+        }
+
         let now = wall_ns();
         if did_work {
             last_msg_at = now;
@@ -839,20 +995,22 @@ fn run_ingest_loop(
             std::thread::sleep(idle_sleep);
         }
 
-        if args.limit != 0 && trade_count + quote_count >= args.limit {
-            info!(trade_count, quote_count, "limit reached; exiting");
+        if args.limit != 0 && trade_count + quote_count + book_l2_count >= args.limit {
+            info!(trade_count, quote_count, book_l2_count, "limit reached; exiting");
             break;
         }
 
         if now.saturating_sub(last_log_at) > log_period_ns {
             let t = trade_lat.snapshot();
             let q = quote_lat.snapshot();
+            let b = book_l2_lat.snapshot();
             let qry = query_lat.snapshot();
             info!(
-                trade_count, quote_count,
-                trade_p50_ns = ?t.p50, trade_p99_ns = ?t.p99, trade_samples = t.samples,
-                quote_p50_ns = ?q.p50, quote_p99_ns = ?q.p99, quote_samples = q.samples,
-                query_p50_ns = ?qry.p50, query_p99_ns = ?qry.p99, query_samples = qry.samples,
+                trade_count, quote_count, book_l2_count,
+                trade_p50_ns   = ?t.p50, trade_p99_ns   = ?t.p99, trade_samples   = t.samples,
+                quote_p50_ns   = ?q.p50, quote_p99_ns   = ?q.p99, quote_samples   = q.samples,
+                book_l2_p50_ns = ?b.p50, book_l2_p99_ns = ?b.p99, book_l2_samples = b.samples,
+                query_p50_ns   = ?qry.p50, query_p99_ns = ?qry.p99, query_samples = qry.samples,
                 "rdb stats"
             );
             last_log_at = now;
@@ -861,12 +1019,14 @@ fn run_ingest_loop(
 
     let t = trade_lat.snapshot();
     let q = quote_lat.snapshot();
+    let b = book_l2_lat.snapshot();
     let qry = query_lat.snapshot();
     info!(
-        trade_count, quote_count,
-        trade_p50_ns = ?t.p50, trade_p99_ns = ?t.p99,
-        quote_p50_ns = ?q.p50, quote_p99_ns = ?q.p99,
-        query_p50_ns = ?qry.p50, query_p99_ns = ?qry.p99, query_samples = qry.samples,
+        trade_count, quote_count, book_l2_count,
+        trade_p50_ns   = ?t.p50, trade_p99_ns   = ?t.p99,
+        quote_p50_ns   = ?q.p50, quote_p99_ns   = ?q.p99,
+        book_l2_p50_ns = ?b.p50, book_l2_p99_ns = ?b.p99,
+        query_p50_ns   = ?qry.p50, query_p99_ns = ?qry.p99, query_samples = qry.samples,
         "rdb final stats"
     );
     Ok(())

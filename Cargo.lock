@@ -3396,6 +3396,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "tokio",
+ "toml",
  "tp-arrow",
  "tp-config",
  "tp-types",

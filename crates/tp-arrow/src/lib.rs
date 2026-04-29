@@ -22,7 +22,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parking_lot::Mutex;
 
 use tp_config::SymbolTable;
-use tp_types::{QuoteL1, Side, Trade};
+use tp_types::{BookL2, QuoteL1, Side, Trade, BOOK_L2_LEVELS};
 
 #[derive(Default)]
 pub struct TradeColumns {
@@ -100,6 +100,56 @@ impl QuoteColumns {
         self.bid_qty.pop_front();
         self.ask_price.pop_front();
         self.ask_qty.pop_front();
+    }
+}
+
+/// L2 order-book column store. Each row carries `BOOK_L2_LEVELS` price+qty
+/// pairs per side, ordered best-first (index 0 = best bid / best ask). Empty
+/// trailing levels are zero-padded by the publisher.
+#[derive(Default)]
+pub struct BookColumns {
+    pub seq: VecDeque<u64>,
+    pub ts_exchange_ns: VecDeque<u64>,
+    pub ts_local_ns: VecDeque<u64>,
+    /// Levels-major: `bid_prices[level][row]` would be too tall to manage as
+    /// a flat Vec, so we keep it as `[VecDeque<i64>; BOOK_L2_LEVELS]`.
+    pub bid_prices: [VecDeque<i64>; BOOK_L2_LEVELS],
+    pub bid_qtys:   [VecDeque<i64>; BOOK_L2_LEVELS],
+    pub ask_prices: [VecDeque<i64>; BOOK_L2_LEVELS],
+    pub ask_qtys:   [VecDeque<i64>; BOOK_L2_LEVELS],
+}
+
+impl BookColumns {
+    pub fn len(&self) -> usize { self.seq.len() }
+    pub fn is_empty(&self) -> bool { self.seq.is_empty() }
+
+    /// Append an L2 record, evicting the oldest row if `max_rows > 0` and the
+    /// store would exceed that limit.
+    pub fn push(&mut self, b: &BookL2, max_rows: usize) {
+        self.seq.push_back(b.seq);
+        self.ts_exchange_ns.push_back(b.ts_exchange_ns);
+        self.ts_local_ns.push_back(b.ts_local_ns);
+        for lvl in 0..BOOK_L2_LEVELS {
+            self.bid_prices[lvl].push_back(b.bid_prices[lvl]);
+            self.bid_qtys[lvl].push_back(b.bid_qtys[lvl]);
+            self.ask_prices[lvl].push_back(b.ask_prices[lvl]);
+            self.ask_qtys[lvl].push_back(b.ask_qtys[lvl]);
+        }
+        if max_rows > 0 && self.seq.len() > max_rows {
+            self.pop_oldest();
+        }
+    }
+
+    fn pop_oldest(&mut self) {
+        self.seq.pop_front();
+        self.ts_exchange_ns.pop_front();
+        self.ts_local_ns.pop_front();
+        for lvl in 0..BOOK_L2_LEVELS {
+            self.bid_prices[lvl].pop_front();
+            self.bid_qtys[lvl].pop_front();
+            self.ask_prices[lvl].pop_front();
+            self.ask_qtys[lvl].pop_front();
+        }
     }
 }
 
@@ -185,6 +235,7 @@ pub struct SymbolStore {
     pub qty_scale: u8,
     pub trades: Mutex<TradeColumns>,
     pub quotes: Mutex<QuoteColumns>,
+    pub book_l2: Mutex<BookColumns>,
     pub bars:   Mutex<BarColumns>,
 }
 
@@ -194,6 +245,7 @@ impl SymbolStore {
             symbol_id, symbol, price_scale, qty_scale,
             trades: Mutex::new(TradeColumns::default()),
             quotes: Mutex::new(QuoteColumns::default()),
+            book_l2: Mutex::new(BookColumns::default()),
             bars:   Mutex::new(BarColumns::default()),
         }
     }
@@ -240,9 +292,10 @@ pub struct RollupBatch {
 /// All per-symbol stores. Owns the Arrow schemas it materializes.
 pub struct StoreSet {
     pub stores: Vec<Arc<SymbolStore>>,
-    pub trades_schema: SchemaRef,
-    pub quotes_schema: SchemaRef,
-    pub bars_schema:   SchemaRef,
+    pub trades_schema:  SchemaRef,
+    pub quotes_schema:  SchemaRef,
+    pub bars_schema:    SchemaRef,
+    pub book_l2_schema: SchemaRef,
 }
 
 impl StoreSet {
@@ -255,9 +308,10 @@ impl StoreSet {
             .collect();
         Self {
             stores,
-            trades_schema: trades_schema(),
-            quotes_schema: quotes_schema(),
-            bars_schema:   bars_schema(),
+            trades_schema:  trades_schema(),
+            quotes_schema:  quotes_schema(),
+            bars_schema:    bars_schema(),
+            book_l2_schema: book_l2_schema(),
         }
     }
 
@@ -499,6 +553,52 @@ impl StoreSet {
         ];
         Ok(RecordBatch::try_new(self.bars_schema.clone(), arrays)?)
     }
+
+    /// Snapshot the in-memory L2 books across all symbols. Each row contains
+    /// `BOOK_L2_LEVELS` price+qty pairs per side, decoded to f64.
+    pub fn snapshot_book_l2(&self) -> anyhow::Result<RecordBatch> {
+        let mut symbol = Vec::new();
+        let mut symbol_id = Vec::new();
+        let mut seq = Vec::new();
+        let mut ts_exchange_ns = Vec::new();
+        let mut ts_local_ns = Vec::new();
+        let mut bid_prices: Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+        let mut bid_qtys:   Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+        let mut ask_prices: Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+        let mut ask_qtys:   Vec<Vec<f64>> = (0..BOOK_L2_LEVELS).map(|_| Vec::new()).collect();
+
+        for store in &self.stores {
+            let cols = store.book_l2.lock();
+            for i in 0..cols.len() {
+                symbol.push(store.symbol.clone());
+                symbol_id.push(store.symbol_id);
+                seq.push(cols.seq[i]);
+                ts_exchange_ns.push(cols.ts_exchange_ns[i]);
+                ts_local_ns.push(cols.ts_local_ns[i]);
+                for lvl in 0..BOOK_L2_LEVELS {
+                    bid_prices[lvl].push(decode_fixed(cols.bid_prices[lvl][i], store.price_scale));
+                    bid_qtys[lvl].push(decode_fixed(cols.bid_qtys[lvl][i],   store.qty_scale));
+                    ask_prices[lvl].push(decode_fixed(cols.ask_prices[lvl][i], store.price_scale));
+                    ask_qtys[lvl].push(decode_fixed(cols.ask_qtys[lvl][i],   store.qty_scale));
+                }
+            }
+        }
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(5 + 4 * BOOK_L2_LEVELS);
+        arrays.push(Arc::new(StringArray::from(symbol)));
+        arrays.push(Arc::new(UInt32Array::from(symbol_id)));
+        arrays.push(Arc::new(UInt64Array::from(seq)));
+        arrays.push(Arc::new(UInt64Array::from(ts_exchange_ns)));
+        arrays.push(Arc::new(UInt64Array::from(ts_local_ns)));
+        for lvl in 0..BOOK_L2_LEVELS {
+            arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut bid_prices[lvl]))));
+            arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut bid_qtys[lvl]))));
+        }
+        for lvl in 0..BOOK_L2_LEVELS {
+            arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut ask_prices[lvl]))));
+            arrays.push(Arc::new(Float64Array::from(std::mem::take(&mut ask_qtys[lvl]))));
+        }
+        Ok(RecordBatch::try_new(self.book_l2_schema.clone(), arrays)?)
+    }
 }
 
 pub fn trades_schema() -> SchemaRef {
@@ -526,6 +626,24 @@ pub fn bars_schema() -> SchemaRef {
         Field::new("vwap",          DataType::Float64, false),
         Field::new("volume",        DataType::Float64, false),
     ]))
+}
+
+pub fn book_l2_schema() -> SchemaRef {
+    let mut fields: Vec<Field> = Vec::with_capacity(5 + 4 * BOOK_L2_LEVELS);
+    fields.push(Field::new("symbol",         DataType::Utf8,    false));
+    fields.push(Field::new("symbol_id",      DataType::UInt32,  false));
+    fields.push(Field::new("seq",            DataType::UInt64,  false));
+    fields.push(Field::new("ts_exchange_ns", DataType::UInt64,  false));
+    fields.push(Field::new("ts_local_ns",    DataType::UInt64,  false));
+    for lvl in 0..BOOK_L2_LEVELS {
+        fields.push(Field::new(format!("bid_price_{lvl}"), DataType::Float64, false));
+        fields.push(Field::new(format!("bid_qty_{lvl}"),   DataType::Float64, false));
+    }
+    for lvl in 0..BOOK_L2_LEVELS {
+        fields.push(Field::new(format!("ask_price_{lvl}"), DataType::Float64, false));
+        fields.push(Field::new(format!("ask_qty_{lvl}"),   DataType::Float64, false));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 pub fn quotes_schema() -> SchemaRef {
