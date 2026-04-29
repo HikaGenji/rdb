@@ -82,6 +82,9 @@ shared zero-copy across processes:
   price (fixed-point i64), qty (fixed-point i64), side.
 - `QuoteL1` — 64 bytes: seq, ts_exchange_ns, ts_local_ns, symbol_id,
   bid_price/qty, ask_price/qty.
+- `BookL2` — ~192 bytes: seq, ts_exchange_ns, ts_local_ns, symbol_id,
+  five (price, qty) levels per side, best-first. Trailing levels
+  zero-padded.
 
 Symbol ids are assigned at startup from `config/symbols.toml` (the order
 in the file is the id). The `price` and `qty` columns are stored as
@@ -104,6 +107,11 @@ quotes_live / quotes_hist / quotes — same pattern
 trades_bars   live OHLCV bars maintained per tick (one row per
               (symbol, ts_bucket_ns) bucket, default 60-second buckets)
               — controlled by --bar-interval-secs on `rdb serve`.
+
+book_l2_live  live L2 order-book snapshots: top-of-book + 4 deeper
+              levels per side. Levels are flat columns
+              (bid_price_0..ask_qty_4) so vanilla SQL works without
+              array operators.
 ```
 
 Column schemas:
@@ -120,6 +128,11 @@ quotes(symbol Utf8, symbol_id u32, seq u64,
 trades_bars(symbol Utf8, symbol_id u32, ts_bucket_ns u64,
             open f64, high f64, low f64, close f64,
             vwap f64, volume f64)
+
+book_l2_live(symbol Utf8, symbol_id u32, seq u64,
+             ts_exchange_ns u64, ts_local_ns u64,
+             bid_price_0 f64, bid_qty_0 f64,  …  bid_price_4 f64, bid_qty_4 f64,
+             ask_price_0 f64, ask_qty_0 f64,  …  ask_price_4 f64, ask_qty_4 f64)
 ```
 
 Queries can use the full DuckDB SQL surface, including `ASOF JOIN` and
@@ -127,7 +140,7 @@ Parquet predicate-pushdown when filtering on timestamp columns.
 
 ### Streaming subscribe
 
-Send `SUBSCRIBE trades` or `SUBSCRIBE quotes` instead of a regular SELECT
+Send `SUBSCRIBE trades`, `SUBSCRIBE quotes`, or `SUBSCRIBE book_l2` instead of a regular SELECT
 and the server keeps the connection open, pushing every newly ingested
 record as an Arrow IPC batch (flushed every 256 rows or every 50 ms,
 whichever comes first). The CLI auto-detects subscribe and prints
@@ -227,6 +240,22 @@ Arrow IPC response to Postgres wire-format rows, and maps Arrow types to
 their closest Postgres equivalents (Float64 → FLOAT8, UInt64 → INT8,
 Utf8 → TEXT, …). Session-level commands sent by tools on connect (`SET`,
 `BEGIN`, `RESET`, …) are acknowledged without being forwarded.
+
+### Authentication
+
+By default the gateway accepts any client without credentials (legacy
+behaviour). Pass `--password-file <path>` to require Postgres-style MD5
+authentication. The file is TOML, one user per line:
+
+```toml
+alice = "secret"
+bob   = "anotherone"
+```
+
+Each connection generates a fresh 4-byte salt; the client must reply
+with `md5(md5(password+username) || salt)` per the standard Postgres
+protocol. Salt entropy is wall-clock-derived in this prototype — fine
+for development but a real deployment should switch to a CSPRNG.
 
 ## Latency hops
 
