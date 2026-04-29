@@ -142,7 +142,7 @@ pub fn wall_ns() -> u64 {
 /// One per line in a JSONL file. The replayer turns these into [`Trade`] /
 /// [`QuoteL1`] before publishing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FeedEvent {
     Trade {
         symbol: String,
