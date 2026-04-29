@@ -1,9 +1,11 @@
 //! `rdb pg-gateway` — PostgreSQL wire-protocol gateway for the rdb Unix socket.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use arrow_array::{Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
@@ -11,7 +13,11 @@ use arrow_array::{Array, BooleanArray, Float32Array, Float64Array, Int32Array, I
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, Sink};
+use pgwire::api::auth::md5pass::{hash_md5_password, Md5PasswordAuthStartupHandler};
 use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::auth::{
+    AuthSource, DefaultServerParameterProvider, LoginInfo, Password,
+};
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
@@ -33,6 +39,13 @@ pub struct Args {
     /// TCP address to listen on.
     #[arg(long, default_value = "0.0.0.0:5432")]
     listen: String,
+
+    /// Optional TOML password file. Format: one `username = "password"` line
+    /// per user (plaintext). When set, the gateway requires Postgres-style
+    /// MD5 authentication; absent, the gateway accepts any client without
+    /// credentials (the prior behaviour). The file is read once at startup.
+    #[arg(long)]
+    password_file: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -40,17 +53,46 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(serve(args))
+    let users = match &args.password_file {
+        Some(p) => {
+            let s = std::fs::read_to_string(p)
+                .with_context(|| format!("reading {}", p.display()))?;
+            let map: HashMap<String, String> = toml::from_str(&s)
+                .with_context(|| format!("parsing {}", p.display()))?;
+            Some(map)
+        }
+        None => None,
+    };
+    rt.block_on(serve(args, users))
 }
 
-async fn serve(args: Args) -> anyhow::Result<()> {
-    let factory = Arc::new(GatewayFactory {
-        handler: Arc::new(RdbHandler::new(args.socket.clone())),
-    });
-
+async fn serve(args: Args, users: Option<HashMap<String, String>>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&args.listen).await?;
-    eprintln!("rdb-pg-gateway: {} → {}", args.listen, args.socket.display());
+    let auth_label = if users.is_some() { "md5" } else { "none" };
+    eprintln!(
+        "rdb-pg-gateway: {} → {} (auth: {})",
+        args.listen, args.socket.display(), auth_label
+    );
 
+    if let Some(users) = users {
+        let factory = Arc::new(Md5GatewayFactory {
+            handler: Arc::new(RdbHandler::new(args.socket.clone())),
+            auth_source: Arc::new(StaticAuthSource { users }),
+            param_provider: Arc::new(DefaultServerParameterProvider::default()),
+        });
+        accept_loop(listener, factory).await
+    } else {
+        let factory = Arc::new(NoopGatewayFactory {
+            handler: Arc::new(RdbHandler::new(args.socket.clone())),
+        });
+        accept_loop(listener, factory).await
+    }
+}
+
+async fn accept_loop<F>(listener: TcpListener, factory: Arc<F>) -> anyhow::Result<()>
+where
+    F: PgWireHandlerFactory + Send + Sync + 'static,
+{
     loop {
         let (socket, addr) = listener.accept().await?;
         let factory = factory.clone();
@@ -73,6 +115,31 @@ impl RdbHandler {
 }
 
 impl NoopStartupHandler for RdbHandler {}
+
+/// Maps usernames to plaintext passwords (loaded from `--password-file`).
+/// Per-connection, returns the salted MD5 hash that the client's reply
+/// must equal. Username miss returns a deliberately wrong hash so the
+/// authentication fails without leaking which usernames exist.
+struct StaticAuthSource {
+    users: HashMap<String, String>,
+}
+
+#[async_trait]
+impl AuthSource for StaticAuthSource {
+    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
+        let user = login.user().unwrap_or("");
+        let plaintext = self.users.get(user).cloned().unwrap_or_default();
+        // 4-byte salt seeded from the wall clock. Not cryptographically
+        // strong; sufficient to make MD5 hashes per-connection unique.
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u32)
+            .unwrap_or(0);
+        let salt = nanos.to_le_bytes().to_vec();
+        let hashed = hash_md5_password(user, &plaintext, &salt);
+        Ok(Password::new(Some(salt), hashed.into_bytes()))
+    }
+}
 
 fn arrow_to_pg(dt: &DataType) -> Type {
     match dt {
@@ -216,11 +283,11 @@ impl SimpleQueryHandler for RdbHandler {
     }
 }
 
-struct GatewayFactory {
+struct NoopGatewayFactory {
     handler: Arc<RdbHandler>,
 }
 
-impl PgWireHandlerFactory for GatewayFactory {
+impl PgWireHandlerFactory for NoopGatewayFactory {
     type StartupHandler = RdbHandler;
     type SimpleQueryHandler = RdbHandler;
     type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
@@ -228,6 +295,39 @@ impl PgWireHandlerFactory for GatewayFactory {
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
         self.handler.clone()
+    }
+
+    fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
+        self.handler.clone()
+    }
+
+    fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
+        Arc::new(PlaceholderExtendedQueryHandler)
+    }
+
+    fn copy_handler(&self) -> Arc<Self::CopyHandler> {
+        Arc::new(NoopCopyHandler)
+    }
+}
+
+struct Md5GatewayFactory {
+    handler: Arc<RdbHandler>,
+    auth_source: Arc<StaticAuthSource>,
+    param_provider: Arc<DefaultServerParameterProvider>,
+}
+
+impl PgWireHandlerFactory for Md5GatewayFactory {
+    type StartupHandler =
+        Md5PasswordAuthStartupHandler<StaticAuthSource, DefaultServerParameterProvider>;
+    type SimpleQueryHandler = RdbHandler;
+    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type CopyHandler = NoopCopyHandler;
+
+    fn startup_handler(&self) -> Arc<Self::StartupHandler> {
+        Arc::new(Md5PasswordAuthStartupHandler::new(
+            self.auth_source.clone(),
+            self.param_provider.clone(),
+        ))
     }
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
